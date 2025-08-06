@@ -261,6 +261,10 @@ As a user I would like to be able to opt out of deprecation warnings.
 
 https://github.com/kubernetes/kubectl/issues/1317
 
+#### Story 5
+
+As a user I would like to be able to add client auth exec plugins to an allowlist.
+
 ### Notes/Constraints/Caveats (Optional)
 
 <!--
@@ -277,6 +281,7 @@ This might be a good place to talk about core concepts and how they relate.
 1. [How do we handle tying these settings to cluster contexts?](https://github.com/kubernetes/enhancements/pull/3392#discussion_r898239057)
 1. [Do we want this file to live elsewhere i.e. XDG_CONFIG?](https://github.com/kubernetes/enhancements/pull/3392#discussion_r896177353)
 1. [How do we exectue subcommands and do we want to support variable substitution i.e. `$1`](https://github.com/kubernetes/enhancements/pull/3392#discussion_r898227148)
+1. [Does the client exec plugin allowlist specify the full path or the basename?](https://www.youtube.com/watch?v=jk_VBYZq-AU)
 
 ### Risks and Mitigations
 
@@ -319,6 +324,7 @@ fields (`apiVersion`, `kind`):
 
 * `aliases` Allows users to declare their own command aliases, including options and values.
 * `defaults` Enables users to set default options to be applied to commands.
+* `plugins` Enables users to set options for plugins.
 
 `aliases` will not be permitted to override built-in commands but will take
 precedence over plugins (builtins -> aliases -> plugins). Any additional options
@@ -330,6 +336,14 @@ initially implemented as options. This design decision was made after analyzing 
 intended behavior and realizing that targeting options effectively addresses the
 use cases. During command execution, a merge will occur, with inline overrides
 taking precedence over the defaults.
+
+`plugins` allows the end-user to provide options relevant to specific plugins.
+These options will bear the `apiVersion` and `kind` corresponding to that of a
+plugin. These options will be passed, uninterpreted, to a supported plugin's
+configuration implementation, which will handle merging of these options with
+any provided elsewhere. If there are any conflicts between options provided
+here and those provided elsewhere, plugin options in kuberc will take
+precedence.
 
 ```
 apiVersion: kubectl.config.k8s.io/v1beta1
@@ -356,6 +370,12 @@ defaults:
       - name: interactive
         default: "true"
 
+plugins:
+  - apiVersion: client.authentication.k8s.io/v1
+    kind: ExecCredential
+    spec:
+      allowList:
+        - basename: cloud-auth-program
 ```
 
 ### Test Plan
