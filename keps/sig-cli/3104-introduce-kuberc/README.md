@@ -328,7 +328,7 @@ responsible for defining aliases with this behavior in mind.
 `defaults` is designed based on the principle that all configurable behavior is
 initially implemented as options. This design decision was made after analyzing the
 intended behavior and realizing that targeting options effectively addresses the
-use cases. During command execution, a merge will be occur, with inline overrides
+use cases. During command execution, a merge will occur, with inline overrides
 taking precedence over the defaults.
 
 ```
