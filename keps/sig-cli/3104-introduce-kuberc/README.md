@@ -261,6 +261,10 @@ As a user I would like to be able to opt out of deprecation warnings.
 
 https://github.com/kubernetes/kubectl/issues/1317
 
+#### Story 5
+
+As a user I would like to be able to prevent the execution of untrusted binaries by the client-go credential plugin system.
+
 ### Notes/Constraints/Caveats (Optional)
 
 <!--
@@ -277,6 +281,7 @@ This might be a good place to talk about core concepts and how they relate.
 1. [How do we handle tying these settings to cluster contexts?](https://github.com/kubernetes/enhancements/pull/3392#discussion_r898239057)
 1. [Do we want this file to live elsewhere i.e. XDG_CONFIG?](https://github.com/kubernetes/enhancements/pull/3392#discussion_r896177353)
 1. [How do we exectue subcommands and do we want to support variable substitution i.e. `$1`](https://github.com/kubernetes/enhancements/pull/3392#discussion_r898227148)
+1. [Does the client exec plugin allowlist specify the full path or the basename?](https://www.youtube.com/watch?v=jk_VBYZq-AU)
 
 ### Risks and Mitigations
 
@@ -319,6 +324,7 @@ fields (`apiVersion`, `kind`):
 
 * `aliases` Allows users to declare their own command aliases, including options and values.
 * `defaults` Enables users to set default options to be applied to commands.
+* `credentialPluginAllowList` Enables users to specify criteria for trusting binaries to be executed by the client-go credential plugin system.
 
 `aliases` will not be permitted to override built-in commands but will take
 precedence over plugins (builtins -> aliases -> plugins). Any additional options
@@ -330,6 +336,11 @@ initially implemented as options. This design decision was made after analyzing 
 intended behavior and realizing that targeting options effectively addresses the
 use cases. During command execution, a merge will be occur, with inline overrides
 taking precedence over the defaults.
+
+`credentialPlugins` allows the end-user to provide options relevant to the
+client-go credential plugin system. At present, the only option available is
+`allowList`, which is an array of objects describing required conditions for
+executing a credential plugin binary.
 
 ```
 apiVersion: kubectl.config.k8s.io/v1beta1
@@ -356,6 +367,56 @@ defaults:
       - name: interactive
         default: "true"
 
+credentialPlugins:
+  allowList:
+    #example 2
+    - validations: ["name", "digest"]
+      name: custom-credential-script
+      digest: sha256:abc123deadbeef...
+    - validations: ["name", "digest"]
+      name: custom-credential-script
+      digest: sha256:abc123deadbeef...
+```
+
+```go
+
+type validationType string
+
+const (
+    validationName validationType = "name"
+)
+
+// kube 1.35
+type AllowListItem struct {
+    Validations []validationType
+    Name string
+}
+
+for _, v := range allowList.Validations {
+    switch v {
+        case "name":
+            continue
+        default:
+            return fmt.Errorf("unrecognized validation: %q", v)
+    }
+}
+
+// kube 1.36
+type AllowListItem struct {
+    Validations []string
+    Name string
+    Digest string
+    Pubkey string
+}
+
+for _, v := range allowList.Validations {
+    switch v {
+        case "name", "digest", "pubkey":
+            continue
+        default:
+            return fmt.Errorf("unrecognized validation: %q", v)
+    }
+}
 ```
 
 ### Test Plan
