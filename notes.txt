@@ -1,0 +1,76 @@
+Summary
+    - WAT is just convention
+    - Verify audience, api group, api version match resource in admission request
+
+Motivation
+    Fix language
+    Pod level network access
+
+Goals:
+    - backward compatibility with existing authentication mechanism
+    - backward compatibility with bespoke authentication solutions for aggregated API servers authenticating to webhooks
+    - clarify "webhook authors" goal
+
+Non-Goals:
+    - library will be in-tree, must be defined
+
+Things to clarify with @Mo:
+    - Go over why no non-admission webhooks
+    - controller to recreate serviceaccount when deleted?
+    - SAR needed when principal is KAS?
+    - authorizer.Authorize() call? Or SAR request via API
+    - remind me what audience should be?
+
+Prose over bullets
+
+Aggregated API Servers
+    - (service account token, not necessarily)
+    - Remove references to `engelbert.dev`
+    - Specify body of request AdmissionReview request, specify `Authorization: Bearer <token>`
+    - Don't note expectations or discouragements.
+
+Authorization Checks
+   Update RBAC rules (give example)
+
+Audience:
+    - URL (I don't think it's right)
+
+Token Caching and Rotation
+    - expired token -- "when a cached token has expired" -- is this KAS or AAS as the actor here?
+    - no need to mention that users can set expirationSeconds
+
+Webhook Verification: give example
+
+Don't use `v1.` as the example anywhere.
+
+Clean up language of user stories.
+
+Note the assumption that an AAS won't be asking questions about resources it doesn't manage.
+
+Define what "the token becomes invalid" means.
+
+RBAC is useless without the bindings.
+
+Unit tests: What is this "<date>-<converage>"
+
+Formatting on what unit tests will cover
+
+Integration tests: ensure invalid tokens of many different configurations are rejected, using the newly added library code
+
+Graduation Criteria:
+Everything by alpha
+    WAT issuance must be for kube-apiserver *AND* aggregated API servers in alpha
+    All tests passing and stable in alpha
+
+Upgrade/Downgrade strategy:
+    - existing auth methods may fail if WH is expecting bearer token in another format
+
+Version skew:
+    - and webhook library code
+
+Drawbacks:
+
+Be more specific with Implementation History Alternatives
+    - some replicas present WATs while others do not? Surely this is wrong, unless there are version mismatches
+
+Metrics -- add new ones?
