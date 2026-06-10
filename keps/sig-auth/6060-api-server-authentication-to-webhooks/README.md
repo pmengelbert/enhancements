@@ -74,7 +74,7 @@ Items marked with (R) are required *prior to targeting to a milestone / release*
 ## Summary
 
 Today, the kube-apiserver does not authenticate itself to admission webhooks
-by default. Any entity with pod network access can send requests to a webhook
+by default. Any entity with service network access can send requests to a webhook
 endpoint and impersonate the kube-apiserver.
 [CVE-2025-1974](https://nvd.nist.gov/vuln/detail/CVE-2025-1974) demonstrated
 real-world consequences of this class of vulnerability.
@@ -90,7 +90,7 @@ being admitted.
 
 ## Motivation
 
-Any entity with pod network access can send requests to an admission webhook
+Any entity with service network access can send requests to an admission webhook
 endpoint. If the webhook does not authenticate the caller, an attacker can
 probe for policy information, trigger unintended side effects, or exploit
 the webhook's own privileges within the cluster.
@@ -98,9 +98,9 @@ the webhook's own privileges within the cluster.
 Opt-in mechanisms for authenticating the kube-apiserver to webhooks exist
 (client certs, bearer tokens, or basic auth via a kubeconfig file configured
 through `--admission-control-config-file`), but they require manual credential
-management and an API server restart to change. As a result, most deployments
-do not use them, leaving webhook endpoints effectively open to any caller on
-the pod network.
+management and an API server restart to change. In practice, this means that
+when the actor setting up the API Server (or aggregated API server) and the
+actor setting up the webhook are not the same, no authentication is used.
 
 ### Goals
 
@@ -113,6 +113,7 @@ the pod network.
   or one set of resources against another.
 * The design is backward compatible: existing kubeconfig-based webhook
   authentication setups continue to work without modification.
+* Defining the exact webhook-side verification go library.
 * Webhook authors can verify the kube-apiserver's identity with minimal code
   changes, using existing OIDC token verification libraries.
 
@@ -121,9 +122,6 @@ the pod network.
 * Authentication to non-admission webhooks (authentication webhooks,
   authorization webhooks). These use a different configuration mechanism
   (CLI flags with kubeconfig files) and are out of scope for this KEP.
-* Defining the exact webhook-side verification library. Follow-up work is
-  planned to contribute authentication support to existing open-source
-  webhooks, but the library itself is out of scope.
 * Changes to the APIService API. No new fields are added to the APIService
   spec.
 
