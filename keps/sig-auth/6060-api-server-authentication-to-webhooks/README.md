@@ -23,6 +23,9 @@
   - [New Private Claims](#new-private-claims)
   - [BoundObjectRef for APIService](#boundobjectref-for-apiservice)
   - [RBAC Configuration](#rbac-configuration)
+  - [Sequence Diagrams](#sequence-diagrams)
+    - [Flow 1: Kube-apiserver authenticates to an admission webhook](#flow-1-kube-apiserver-authenticates-to-an-admission-webhook)
+    - [Flow 2: Aggregated API server authenticates to an admission webhook](#flow-2-aggregated-api-server-authenticates-to-an-admission-webhook)
   - [Kube-apiserver Service Account Lifecycle](#kube-apiserver-service-account-lifecycle)
   - [Test Plan](#test-plan)
       - [Prerequisite testing updates](#prerequisite-testing-updates)
@@ -366,6 +369,110 @@ rules:
   resources: ["apiservices"]
   resourceNames: ["v1.engelbert.dev"]
   verbs: ["attest"]
+```
+
+### Sequence Diagrams
+
+The following diagrams illustrate the two primary flows for WAT issuance
+and webhook authentication.
+
+#### Flow 1: Kube-apiserver authenticates to an admission webhook
+
+In this flow, `kube-apiserver` is both the token issuer and the webhook
+caller. It requests a WAT from itself (in-process) for its dedicated
+service account, bound to the APIService for the resource being admitted.
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant KAS as kube-apiserver
+    participant TokenReq as TokenRequest Handler<br/>(in-process)
+    participant Authz as Authorization<br/>(in-process)
+    participant Webhook as Admission Webhook
+
+    User->>KAS: Create Pod
+
+    Note over KAS: Admission requires<br/>consulting webhook
+
+    KAS->>KAS: Check WAT cache<br/>(webhook + APIService)
+    alt Cache miss or token expired
+        KAS->>TokenReq: TokenRequest for dedicated SA<br/>BoundObjectRef: APIService "v1."<br/>Audience: k8s.io:admission:<webhook-url>
+
+        TokenReq->>Authz: 1. Can caller "create"<br/>serviceaccounts/token for this SA?
+        Authz-->>TokenReq: Allowed
+
+        TokenReq->>KAS: 2. Does APIService "v1." exist?
+        KAS-->>TokenReq: Exists
+
+        TokenReq->>Authz: 3. Does the dedicated SA have<br/>"attest" on APIService "v1."?
+        Authz-->>TokenReq: Allowed
+
+        TokenReq-->>KAS: WAT issued (JWT with<br/>webhookAuthentication claims)
+        Note over KAS: Cache the WAT
+    end
+
+    KAS->>Webhook: AdmissionReview request<br/>+ Authorization: Bearer <WAT>
+
+    Note over Webhook: Verify JWT signature (OIDC discovery)
+    Note over Webhook: Verify audience matches webhook identity
+    Note over Webhook: Verify APIService claims match<br/>resource in AdmissionReview body
+
+    Webhook-->>KAS: AdmissionReview response
+    KAS-->>User: Response
+```
+
+#### Flow 2: Aggregated API server authenticates to an admission webhook
+
+In this flow, the aggregated API server is a separate process. It
+authenticates to `kube-apiserver`, requests a WAT for its dedicated
+service account, and presents the token to the webhook. The WAT is bound
+to the APIService the aggregated API server serves.
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant KAS as kube-apiserver
+    participant AAS as Aggregated API Server<br/>(serves engelbert.dev/v1)
+    participant Authz as Authorization<br/>(in kube-apiserver)
+    participant TokenReq as TokenRequest Handler<br/>(in kube-apiserver)
+    participant Webhook as Admission Webhook
+
+    User->>KAS: Create Widget (engelbert.dev/v1)
+    KAS->>AAS: Proxy request to aggregated API server
+
+    Note over AAS: Admission requires<br/>consulting webhook
+
+    AAS->>AAS: Check WAT cache<br/>(webhook + APIService)
+    alt Cache miss or token expired
+        AAS->>KAS: Authenticate (e.g., own SA token)
+
+        AAS->>KAS: TokenRequest for dedicated SA<br/>BoundObjectRef: APIService "v1.engelbert.dev"<br/>Audience: k8s.io:admission:<webhook-url>
+
+        KAS->>Authz: 1. Can caller "create"<br/>serviceaccounts/token for this SA?
+        Authz-->>KAS: Allowed (ClusterRole + binding)
+
+        KAS->>KAS: 2. Does APIService<br/>"v1.engelbert.dev" exist?
+        Note over KAS: Exists
+
+        KAS->>Authz: 3. Does the dedicated SA have<br/>"attest" on APIService "v1.engelbert.dev"?
+        Authz-->>KAS: Allowed (ClusterRole + binding)
+
+        KAS->>TokenReq: Issue WAT
+        TokenReq-->>KAS: WAT (JWT with<br/>webhookAuthentication claims)
+
+        KAS-->>AAS: WAT returned
+        Note over AAS: Cache the WAT
+    end
+
+    AAS->>Webhook: AdmissionReview request<br/>+ Authorization: Bearer <WAT>
+
+    Note over Webhook: Verify JWT signature (OIDC discovery)
+    Note over Webhook: Verify audience matches webhook identity
+    Note over Webhook: Verify APIService claims match<br/>resource in AdmissionReview body
+
+    Webhook-->>AAS: AdmissionReview response
+    AAS-->>KAS: Admission complete, return response
+    KAS-->>User: Response
 ```
 
 ### Kube-apiserver Service Account Lifecycle
