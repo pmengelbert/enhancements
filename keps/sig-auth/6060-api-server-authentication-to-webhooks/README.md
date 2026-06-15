@@ -1,53 +1,87 @@
 # KEP-6060: API Server Authentication to Admission Webhooks
 
 <!-- toc -->
-- [Release Signoff Checklist](#release-signoff-checklist)
-- [Summary](#summary)
-- [Motivation](#motivation)
-  - [Goals](#goals)
-  - [Non-Goals](#non-goals)
-- [Proposal](#proposal)
-  - [Webhook Authentication Tokens](#webhook-authentication-tokens)
-  - [Token Acquisition](#token-acquisition)
-    - [Kube-apiserver](#kube-apiserver)
-    - [Aggregated API Servers](#aggregated-api-servers)
-  - [Authorization Checks](#authorization-checks)
-  - [Audience](#audience)
-  - [Token Caching and Rotation](#token-caching-and-rotation)
-  - [Webhook Verification](#webhook-verification)
-  - [User Stories](#user-stories)
-    - [Story 1: Kube-apiserver authenticates to an admission webhook](#story-1-kube-apiserver-authenticates-to-an-admission-webhook)
-    - [Story 2: Aggregated API server authenticates to an admission webhook](#story-2-aggregated-api-server-authenticates-to-an-admission-webhook)
-  - [Risks and Mitigations](#risks-and-mitigations)
-- [Design Details](#design-details)
-  - [New Private Claims](#new-private-claims)
-  - [BoundObjectRef for APIService](#boundobjectref-for-apiservice)
-  - [RBAC Configuration](#rbac-configuration)
-  - [Sequence Diagrams](#sequence-diagrams)
-    - [Flow 1: Kube-apiserver authenticates to an admission webhook](#flow-1-kube-apiserver-authenticates-to-an-admission-webhook)
-    - [Flow 2: Aggregated API server authenticates to an admission webhook](#flow-2-aggregated-api-server-authenticates-to-an-admission-webhook)
-  - [Kube-apiserver Service Account Lifecycle](#kube-apiserver-service-account-lifecycle)
-  - [Test Plan](#test-plan)
-      - [Prerequisite testing updates](#prerequisite-testing-updates)
-      - [Unit tests](#unit-tests)
-      - [Integration tests](#integration-tests)
-      - [e2e tests](#e2e-tests)
-  - [Graduation Criteria](#graduation-criteria)
-    - [Alpha](#alpha)
-    - [Beta](#beta)
-    - [GA](#ga)
-  - [Upgrade / Downgrade Strategy](#upgrade--downgrade-strategy)
-  - [Version Skew Strategy](#version-skew-strategy)
-- [Production Readiness Review Questionnaire](#production-readiness-review-questionnaire)
-  - [Feature Enablement and Rollback](#feature-enablement-and-rollback)
-  - [Rollout, Upgrade and Rollback Planning](#rollout-upgrade-and-rollback-planning)
-  - [Monitoring Requirements](#monitoring-requirements)
-  - [Dependencies](#dependencies)
-  - [Scalability](#scalability)
-  - [Troubleshooting](#troubleshooting)
-- [Implementation History](#implementation-history)
-- [Drawbacks](#drawbacks)
-- [Alternatives](#alternatives)
+- [KEP-6060: API Server Authentication to Admission Webhooks](#kep-6060-api-server-authentication-to-admission-webhooks)
+  - [Release Signoff Checklist](#release-signoff-checklist)
+  - [Summary](#summary)
+  - [Motivation](#motivation)
+    - [Goals](#goals)
+    - [Non-Goals](#non-goals)
+  - [Proposal](#proposal)
+    - [Webhook Authentication Tokens](#webhook-authentication-tokens)
+    - [Token Acquisition](#token-acquisition)
+      - [Kube-apiserver](#kube-apiserver)
+      - [Aggregated API Servers](#aggregated-api-servers)
+    - [Authorization Checks](#authorization-checks)
+    - [Audience](#audience)
+    - [Token Caching and Rotation](#token-caching-and-rotation)
+    - [Webhook Verification](#webhook-verification)
+    - [User Stories](#user-stories)
+      - [Story 1: Kube-apiserver authenticates to an admission webhook](#story-1-kube-apiserver-authenticates-to-an-admission-webhook)
+      - [Story 2: Aggregated API server authenticates to an admission webhook](#story-2-aggregated-api-server-authenticates-to-an-admission-webhook)
+    - [Risks and Mitigations](#risks-and-mitigations)
+      - [Token replay across webhooks](#token-replay-across-webhooks)
+      - [Token replay across API groups](#token-replay-across-api-groups)
+      - [Service account compromise](#service-account-compromise)
+      - [Increased authorization load](#increased-authorization-load)
+  - [Design Details](#design-details)
+    - [New Private Claims](#new-private-claims)
+    - [BoundObjectRef for APIService](#boundobjectref-for-apiservice)
+    - [RBAC Configuration](#rbac-configuration)
+    - [Sequence Diagrams](#sequence-diagrams)
+      - [Flow 1: Kube-apiserver authenticates to an admission webhook](#flow-1-kube-apiserver-authenticates-to-an-admission-webhook)
+      - [Flow 2: Aggregated API server authenticates to an admission webhook](#flow-2-aggregated-api-server-authenticates-to-an-admission-webhook)
+    - [Kube-apiserver Service Account Lifecycle](#kube-apiserver-service-account-lifecycle)
+    - [Test Plan](#test-plan)
+        - [Prerequisite testing updates](#prerequisite-testing-updates)
+        - [Unit tests](#unit-tests)
+        - [Integration tests](#integration-tests)
+        - [e2e tests](#e2e-tests)
+    - [Graduation Criteria](#graduation-criteria)
+      - [Alpha](#alpha)
+      - [Beta](#beta)
+      - [GA](#ga)
+    - [Upgrade / Downgrade Strategy](#upgrade--downgrade-strategy)
+    - [Version Skew Strategy](#version-skew-strategy)
+  - [Production Readiness Review Questionnaire](#production-readiness-review-questionnaire)
+    - [Feature Enablement and Rollback](#feature-enablement-and-rollback)
+          - [How can this feature be enabled / disabled in a live cluster?](#how-can-this-feature-be-enabled--disabled-in-a-live-cluster)
+          - [Does enabling the feature change any default behavior?](#does-enabling-the-feature-change-any-default-behavior)
+          - [Can the feature be disabled once it has been enabled (i.e. can we roll back the enablement)?](#can-the-feature-be-disabled-once-it-has-been-enabled-ie-can-we-roll-back-the-enablement)
+          - [What happens if we reenable the feature if it was previously rolled back?](#what-happens-if-we-reenable-the-feature-if-it-was-previously-rolled-back)
+          - [Are there any tests for feature enablement/disablement?](#are-there-any-tests-for-feature-enablementdisablement)
+    - [Rollout, Upgrade and Rollback Planning](#rollout-upgrade-and-rollback-planning)
+          - [How can a rollout or rollback fail? Can it impact already running workloads?](#how-can-a-rollout-or-rollback-fail-can-it-impact-already-running-workloads)
+          - [What specific metrics should inform a rollback?](#what-specific-metrics-should-inform-a-rollback)
+          - [Were upgrade and rollback tested? Was the upgrade-\>downgrade-\>upgrade path tested?](#were-upgrade-and-rollback-tested-was-the-upgrade-downgrade-upgrade-path-tested)
+          - [Is the rollout accompanied by any deprecations and/or removals of features, APIs, fields of API types, flags, etc.?](#is-the-rollout-accompanied-by-any-deprecations-andor-removals-of-features-apis-fields-of-api-types-flags-etc)
+    - [Monitoring Requirements](#monitoring-requirements)
+          - [How can an operator determine if the feature is in use by workloads?](#how-can-an-operator-determine-if-the-feature-is-in-use-by-workloads)
+          - [How can someone using this feature know that it is working for their instance?](#how-can-someone-using-this-feature-know-that-it-is-working-for-their-instance)
+          - [What are the reasonable SLOs (Service Level Objectives) for the enhancement?](#what-are-the-reasonable-slos-service-level-objectives-for-the-enhancement)
+          - [What are the SLIs (Service Level Indicators) an operator can use to determine the health of the service?](#what-are-the-slis-service-level-indicators-an-operator-can-use-to-determine-the-health-of-the-service)
+          - [Are there any missing metrics that would be useful to have to improve observability of this feature?](#are-there-any-missing-metrics-that-would-be-useful-to-have-to-improve-observability-of-this-feature)
+    - [Dependencies](#dependencies)
+          - [Does this feature depend on any specific services running in the cluster?](#does-this-feature-depend-on-any-specific-services-running-in-the-cluster)
+    - [Scalability](#scalability)
+          - [Will enabling / using this feature result in any new API calls?](#will-enabling--using-this-feature-result-in-any-new-api-calls)
+          - [Will enabling / using this feature result in introducing new API types?](#will-enabling--using-this-feature-result-in-introducing-new-api-types)
+          - [Will enabling / using this feature result in any new calls to the cloud provider?](#will-enabling--using-this-feature-result-in-any-new-calls-to-the-cloud-provider)
+          - [Will enabling / using this feature result in increasing size or count of the existing API objects?](#will-enabling--using-this-feature-result-in-increasing-size-or-count-of-the-existing-api-objects)
+          - [Will enabling / using this feature result in increasing time taken by any operations covered by existing SLIs/SLOs?](#will-enabling--using-this-feature-result-in-increasing-time-taken-by-any-operations-covered-by-existing-slisslos)
+          - [Will enabling / using this feature result in non-negligible increase of resource usage (CPU, RAM, disk, IO, ...) in any components?](#will-enabling--using-this-feature-result-in-non-negligible-increase-of-resource-usage-cpu-ram-disk-io--in-any-components)
+          - [Can enabling / using this feature result in resource exhaustion of some node resources (PIDs, sockets, inodes, etc.)?](#can-enabling--using-this-feature-result-in-resource-exhaustion-of-some-node-resources-pids-sockets-inodes-etc)
+    - [Troubleshooting](#troubleshooting)
+          - [How does this feature react if the API server and/or etcd is unavailable?](#how-does-this-feature-react-if-the-api-server-andor-etcd-is-unavailable)
+          - [What are other known failure modes?](#what-are-other-known-failure-modes)
+          - [What steps should be taken if SLOs are not being met to determine the problem?](#what-steps-should-be-taken-if-slos-are-not-being-met-to-determine-the-problem)
+  - [Implementation History](#implementation-history)
+  - [Drawbacks](#drawbacks)
+  - [Alternatives](#alternatives)
+    - [Client Certificates (mTLS)](#client-certificates-mtls)
+    - [Designated ServiceAccount ("Magic SA")](#designated-serviceaccount-magic-sa)
+    - [ServiceAccount Token with Identity in Private Claims](#serviceaccount-token-with-identity-in-private-claims)
+    - [AdmissionReview Delegation](#admissionreview-delegation)
 <!-- /toc -->
 
 ## Release Signoff Checklist
@@ -378,9 +412,25 @@ and webhook authentication.
 
 #### Flow 1: Kube-apiserver authenticates to an admission webhook
 
-In this flow, `kube-apiserver` is both the token issuer and the webhook
-caller. It requests a WAT from itself (in-process) for its dedicated
-service account, bound to the APIService for the resource being admitted.
+- A user named Donatello will attempt to create a `deployment` on the cluster.
+- In this flow, `kube-apiserver` is both the token requester, token issuer, and the
+webhook caller.
+- The webhook is named `mutagen-capsule`.
+- The Service Account for the `kube-apiserver` is named `kube-system:webhook-auth`.
+- It requests a WAT from itself for this dedicated service account.
+- The request is for a token that is valid for the webhook rather than a particular
+  APIService.
+- This is accomplished by requesting a token that is bound to the
+  MutatingWebhookConfiguration for the `mutagen-capsule` webhook.
+- The kube-apiserver (as server) performs authentication checks on the dedicated
+  service account and the principal requesting the token (the kube-apiserver as client,
+  in this case).
+- The kube-apiserver will authenticate itself to the webhook.
+- The kube-apiserver will interrogate the webhook on behalf of the user.
+- The webhook will give the kube-apiserver the appropriate response regarding the
+  user's Deployment creation, potentially mutating the request.
+- The kube-apiserver will then take the apporpriate action based on the mutating
+  webhook's response.
 
 ```mermaid
 sequenceDiagram
@@ -390,21 +440,22 @@ sequenceDiagram
     participant Authz as Authorization<br/>(in-process)
     participant Webhook as Admission Webhook
 
-    User->>KAS: Create Pod
+    User->>KAS: Create Deployment
 
     Note over KAS: Admission requires<br/>consulting webhook
 
-    KAS->>KAS: Check WAT cache<br/>(webhook + APIService)
+    KAS->>KAS: Check WAT cache
     alt Cache miss or token expired
-        KAS->>TokenReq: TokenRequest for dedicated SA<br/>BoundObjectRef: APIService "v1."<br/>Audience: k8s.io:admission:<webhook-url>
+        KAS->>TokenReq: TokenRequest for<br/>a dedicated SA token named kube-apiserver-sa-name with <br/>a BoundObjectRef:"MutatingWebhookConfiguration:mutagen-capsule"<br/>and the appropriate audience of http://mutagen-capsule.mutagen-capsule.svc:port/with/path.
 
-        TokenReq->>Authz: 1. Can caller "create"<br/>serviceaccounts/token for this SA?
+
+        TokenReq->>Authz: Can caller "create"<br/>serviceaccounts/token for this SA?
         Authz-->>TokenReq: Allowed
 
-        TokenReq->>KAS: 2. Does APIService "v1." exist?
+        TokenReq->>KAS: Does MutatingWebhookConfiguration "mutagen-capsule" exist?
         KAS-->>TokenReq: Exists
 
-        TokenReq->>Authz: 3. Does the dedicated SA have<br/>"attest" on APIService "v1."?
+        TokenReq->>Authz: Does the dedicated SA have<br/>"attest" on APIService* "v1.apps.k8s.io"?
         Authz-->>TokenReq: Allowed
 
         TokenReq-->>KAS: WAT issued (JWT with<br/>webhookAuthentication claims)
