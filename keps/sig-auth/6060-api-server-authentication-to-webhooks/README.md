@@ -111,9 +111,9 @@ management and an API server restart to change. That opt-in mechanism is
 unopinionated as to the method of authentication (mTLS / token / basic auth),
 creating a large burden on webhook maintainers to support verification of
 client identity by all three methods. More broadly, the burden is greatest
-up the API Server (or aggregated API server) and the actor setting up the
-webhook are not the same, as is usually the case with "off-the-shelf",
-community OSS webhooks.
+when the actor setting up the API Server (or aggregated API server) and the
+actor setting up the webhook are not the same, as is usually the case with
+"off-the-shelf", community OSS webhooks.
 
 An opinionated, on-by-default solution is needed to reduce the friction
 to adoption. This KEP is designed to make it possible to transition in
@@ -148,17 +148,21 @@ to keep the implementation practical for the most common use-cases.
 * Aggregated API servers can authenticate themselves to admission webhooks
   using the same mechanism.
 * Minimal manual setup involved, both for webhook maintainers and cluster
-  administrators. The KEP authors believe firmly that friction prevents adoption.
+  administrators. The KEP authors believe firmly that friction prevents
+  adoption.
 * The default behavior of webhook authentication clients is to procure a
   token and provide it to webhooks.
-* The design does not break webhooks that have not yet adopted token verification.
+* The design does not break webhooks that have not yet adopted token
+  verification.
 * Tokens are scoped per-webhook (by audience) and per-API-group/version
-  (by bound APIService), preventing token replays.
+  (by bound APIService), preventing token replays. Alternatively,
+  tokens may be scoped per-webhook by requesting a token bound to an
+  `MutatingWebhookConfiguration` or `ValidatingWebhookConfiguration`.
 * The design is backward compatible: existing kubeconfig-based webhook
   authentication setups continue to work without modification.
-* Defining the exact webhook-side verification go library.
-* Tokens are dispensed only to authenticated principals with requisite permissions.
-  changes, using existing OIDC token verification libraries.
+* Defining the webhook-side verification go library.
+* Tokens are dispensed only to authenticated principals with requisite
+  permissions.
 
 ### Non-Goals
 
@@ -169,18 +173,19 @@ to keep the implementation practical for the most common use-cases.
 
 ### Webhook Authentication Token
 This KEP introduces a flow for authenticating `kube-apiserver` and Aggregated
-API Servers to admission webhooks using ServiceAccount tokens specialized
-for this use. To distinguish between ServiceAccount tokens used for other
-purposes, the term **Webhook Authentication Token (WAT)** will be used. However,
-it is important to understand that these are ServiceAccount tokens in every
-sense; but their use is constrained by newly added private claims.
+API Servers to admission webhooks using ServiceAccount tokens specialized for
+this use. To distinguish between ServiceAccount tokens used for other purposes,
+the term **Webhook Authentication Token (WAT)** will be used. However, it is
+important to understand that these are ServiceAccount tokens in every sense,
+but their use is distinguished by newly added private claims. Webhooks will
+consider these claims a restriction on their allowed usage.
 
-### Webhook Token Acquisition Service Account The service account named in
-WATs will be termed the **Token Acquisition Service Account (WTASA)**. This
-is distinct from the service account the the principal requesting the token
-might be using to authenticate itself to the Kubernetes API Server. The
-Token Acquisition Service Account must have `attest` permissions on the
-`APIService` object named in the `TokenRequest`.
+### Token Acquisition Service Account
+The service account named in WATs will be termed the **Token Acquisition Service
+Account**. This is distinct from the identity (which may or may not be a service
+account) that the principal requesting the token uses to authenticate itself
+to the Kubernetes API Server. The Token Acquisition Service Account must have
+`attest` permissions on the `APIService` object named in the `TokenRequest`.
 
 ### Webhook Authentication Client
 The term **webhook authentication client** will be used throughout this
@@ -188,10 +193,6 @@ document to refer to the actor who wishes to communicate with an admission
 webhook. There are two general categories of actor: `kube-apiserver` (whether
 a singleton or a replica), and Aggregated API Servers. The overall flow for
 both actors is mostly the same, but with a few subtle differences.
-
-### Various API Servers.
-The term **various API servers** will be used to refer to the union of the
-two sets { kube-apiservers and replicas } and { aggregated api servers }.
 
 ### Aggregated API Servers and `kube-apiserver`
 When referring specifically to the Kubernetes API Server, the terms
@@ -203,27 +204,34 @@ between the two.
 
 ### Webhook Authentication Tokens
 
-A Webhook Authentication Token (WAT) is a service account token (JWT)
-with private claims indicating the API Service about which the subject
-is authorized to consult the webhook. Webhooks must reject tokens whose
+A [Webhook Authentication Token (WAT)](#webhook-authentication-token)
+is a service account token (JWT) with private claims indicating the API
+Service about which the subject is authorized to consult the webhook. In
+special cases, this may be a wildcard. Webhooks must reject tokens whose
 named API Service does not match the resource named in the admission request
 (`AdmissionReview`) body. The WAT is obtained by the existing `TokenRequest`
-API (`create serviceaccounts/token`). The `TokenRequest` handler is updated
-to recognize `APIService` as a valid type for its BoundObjectRef field. The
-token's `kubernetes.io` private claims include the name and UID of the bound
-APIService, which encodes the API group and version of the resources the
-caller is authorized to consult the webhook about.
+API (`create serviceaccounts/token`). The `TokenRequest` handler is updated to
+recognize three new types as valid for its `BoundObjectRef` field: `APIService`,
+`ValidatingWebhookConfiguration`, and `MutatingWebhookConfiguration`. When
+the bound object is an `APIService`, the token's `kubernetes.io` private
+claims include the name and UID of the bound APIService; this encodes the API
+group and version of the resources the caller is authorized to consult the
+webhook about. When the bound object is a `ValidatingWebhookConfiguration`
+or `MutatingWebhookConfiguration`, this `APIService` reference will be `"*"`,
+indicating that the token is bound to the webhook as a whole, not a particular
+`APIService`.
 
 The webhook may verify these tokens by taking the following steps:
 
-1. Verify the token's signature via the OIDC discovery endpoint.
+. Verify the token's signature via the OIDC discovery endpoint.
 1. Verify that the token's audience matches the expected audience. This audience
-   is derived deterministically from the webhook name, and is in the format is
-   in the format `k8s.io:admission:<webhook-name>`, where `<webhook-name>`
-   is the "inner" name of the webhook (i.e. the name in the inner list
-   of webhooks).
+   is derived deterministically from the webhook url, and is in the format
+   is in the format `https://<url>/with/path`, where `<url>` matches that
+   specified in the webhook's configuration.
 1. Verify that the `APIGroup` and `APIVersion` encoded in the token's bound
-   APIService match the `APIGroup` and `Version` of the resource in the body
+   `APIService` are either:
+   a. `"*"`, meaning the token is valid to this webhook for all resources, or
+   b. they match the `APIGroup` and `Version` of the resource in the body
    of the `AdmissionReview` request.
 
 ### Token Acquisition (client perspective)
@@ -232,49 +240,55 @@ The webhook may verify these tokens by taking the following steps:
 
 When a [webhook authentication client](#webhook-authentication-client) needs
 to call an admission webhook about a given resource, it issues a `TokenRequest`
-for its [webhook token acquisition service account](#webhook-token-acquisition-service-account)
+for its [token acquisition service account](#token-acquisition-service-account)
 to the Kubernetes API Server. The request includes:
 
-1. A `BoundObjectRef` pointing to the APIService corresponding to the resource
-   being admitted (e.g., `v1.networking.k8s.io`).
-1. The name of a [webhook token acquisition service
-   account](#webhook-token-acquisition-service-account) with `attest` permission on
+1. A `BoundObjectRef` pointing to either
+   a. the APIService corresponding to the resource being admitted (e.g. `v1.networking.k8s.io`), or
+   b. a `ValidatingWebhookConfiguration` or `MutatingWebhookConfiguration` object.
+1. The name of a [token acquisition service
+   account](#token-acquisition-service-account) with `attest` permission on
    the bound APIService.
-1. An audience derived from the webhook's name.
+1. An audience derived from the webhook's url.
 
-The webhook authentication client will only receive the token the authorization
-checks (described in a separate section below) succeed.
+The `BoundObjectRef` described in 1a are typical of an Aggregated API
+Server, whereas those in 1b are typical for `kube-apiserver`. The webhook
+authentication client will only receive the token if the authorization checks
+(described in a separate section below) succeed.
 
-#### kube-apiserver
+#### `kube-apiserver`:
+In the case of `kube-apiserver`, the [token acquisition service
+account](#token-acqcuisition-service-account) will be a service with a
+well-known name, `kube-system:webhook-auth`, which is automatically created
+in the boostrapping process.
 
-In the case of `kube-apiserver`, the [webhook token acquisition service
-account](#webhook-token-acqcuisition-service-account) will be a discoverable service
-account automatically created in the boostrapping process. The name will be
-randomized to discourage its abuse by other webhook authentication clients.
-
-When `kube-apiserver` needs to call an admission webhook, it will be doing so
-for a resource it serves directly. The bound `APIService` in the `TokenRequest` must be the one corresponding to the relevant resource.
+When `kube-apiserver` needs to call an admission webhook, it will be
+doing so for a resource (or custom resource) it serves directly. The
+`BoundObjectRef` in the `TokenRequest` must be the one corresponding to the
+`ValidatingWebhookConfiguration` or `MutatingWebhookConfiguration` of the
+webhook it seeks to consult. In effect, this is a request for a token is
+valid for **a specific webhook** but for **all `APIService`s**.
 
 The token will be received only when the authorization checks (described below)
 succeed. When the principal is `kube-apiserver`, this will always succeed.
 
-#### Aggregated API Servers
-
+#### Aggregated API Servers:
 When an aggregated API server needs to call an admission webhook, it requests
 a WAT from the Kubernetes API Server. Each aggregated API server should
 have a dedicated service account for this purpose, as it must be named in
 the token request. The request flow is:
 
 1. The aggregated API server authenticates to the kube-apiserver using
-   whatever credential it is configured with. That principal must be authorized
-   to `create serviceaccount/token` in the relevant namespace.
+   whatever credential it is configured with. That principal must be
+   authorized to `create serviceaccount/token` in the relevant namespace,
+   with the appropriate resource name (i.e. that of the token acquisition
+   service account).
 2. It sends a `TokenRequest` for its dedicated service account, with a
    `BoundObjectRef` pointing to the APIService it serves (e.g.,
    `v1.example.com`) and the appropriate audience.
 3. The kube-apiserver performs authorization checks (see below) and issues
    the WAT.
-4. The aggregated API server presents the WAT to the webhook as
-   `Authorization: Bearer <token>`.
+4. The aggregated API server presents the WAT to the webhook in its `Authorization` header.
 
 The token will be received only when the authorization checks (described below)
 succeed.
@@ -288,19 +302,23 @@ aggregated API servers is discouraged.
 When the kube-apiserver receives a `TokenRequest` with an APIService as the
 `BoundObjectRef`, it performs the following checks:
 
-1. RBAC check:** Does the caller have `create` on `serviceaccounts/token`
-   for the service account named in the request?
-2. Does the referenced APIService object actually exist?
-3. Does the [webhook token acquisition service
-   account](#webhook-token-acquisition-service-account) in the request have the
-   `attest` permission on the referenced APIService? This is verified via a
-   SubjectAccessReview-style check (an in-process `authorizer.Authorize()`
-   call) against the service account's identity.
+1. SAR check: Does the principal making the `TokenRequest` have `create` on
+   `serviceaccounts/token` for the service account named in the request?
+1. Does the bound object (which may be an `APIService`, a
+   `ValidatingWebhookConfiguration`, or a `MutatingWebhookConfiguration`)
+   actually exist?
+1. SAR check: Does the [token acquisition service
+   account](#token-acquisition-service-account) in the request have the `attest`
+   permission on the referenced `APIService`, or on the wildcard `APIService`?
+
+The `SubjectAccessReview` (SAR) checks are performed via an
+`authorizer.Authorize()` call against the token acquisition service account's
+identity.
 
 The `attest` verb has precedent (it is already used in Kubernetes for
 ClusterTrustBundle signer attestation). To illustrate the permission model,
 the following RBAC configuration is given as an example. To paraphrase Donald
-Knuth, the example is intentionally baffling, but complete.
+Knuth, the example is baffling, but complete:
 
 ```yaml
 apiVersion: rbac.authorization.k8s.io/v1
@@ -359,23 +377,22 @@ roleRef:
 
 ### Audience
 
-The token's audience is derived from the webhook's name with a fixed prefix.
-For a webhook at `https://my-webhook.my-namespace.svc:443/validate`, the
-audience would be:
+The token's audience is the webhook's configured url.
 
-```
-k8s.io:admission:https://my-webhook.my-namespace.svc:443/validate
-```
-
-The webhook verifies that the token's `aud` claim matches its own identity
-before accepting the request.
+The webhook verifies that the token's `aud` claim matches its configured
+identity before accepting the request.
 
 ### Token Caching and Rotation
 
-WATs are cached per combination of webhook and APIService. When a cached
-token has expired, the next webhook call for that combination triggers a
-new `TokenRequest`. Tokens should be short-lived; users can set
-`expirationSeconds` according to their needs.
+When the bound object is an `APIService`, WATs are cached per
+combination of webhook and `APIService`. When the bound object is a
+`ValidatingWebhookConfiguration` or `MutatingWebhookConfiguration`, the
+WAT will be cached per-webhook. When a cached token has expired, the next
+webhook call for that combination triggers a new `TokenRequest`. Tokens
+will expire after 10 minutes, or some shorter duration specified by the
+user via the `TokenRequest`'s `expirationSeconds`. A request containing
+`expirationSeconds` longer than ten minutes will be silently shortened to
+the maximum of ten minutes.
 
 ### Webhook Verification
 
@@ -395,12 +412,12 @@ A webhook receiving a request with a WAT performs the following checks:
 
 #### Story 1: Kube-apiserver authenticates to an admission webhook
 
-A user creates a Pod. The kube-apiserver needs to consult a validating
+A user creates an `Ingress`. The kube-apiserver needs to consult a validating
 admission webhook. It requests a WAT from itself for its dedicated service
-account, bound to APIService `v1.networking.k8s.io` with an audience derived from the
-webhook's name. The webhook verifies the token and confirms that the API
-group and version in the claims match those of the Pod resource in the
-AdmissionReview body.
+account, bound to APIService `v1.networking.k8s.io` with an audience derived
+from the webhook's url. The webhook verifies the token and confirms that
+the API group and version in the claims match those of the Pod resource in
+the AdmissionReview body.
 
 #### Story 2: Aggregated API server authenticates to an admission webhook
 
