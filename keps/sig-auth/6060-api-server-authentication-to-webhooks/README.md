@@ -412,7 +412,7 @@ and webhook authentication.
 
 #### Flow 1: Kube-apiserver authenticates to an admission webhook
 
-- A user named Donatello will attempt to create a `deployment` on the cluster.
+- A user named Splinter will attempt to create a `deployment` named ninja-turtles on the cluster.
 - In this flow, `kube-apiserver` is both the token requester, token issuer, and the
 webhook caller.
 - The webhook is named `mutagen-capsule`.
@@ -422,90 +422,137 @@ webhook caller.
   APIService.
 - This is accomplished by requesting a token that is bound to the
   MutatingWebhookConfiguration for the `mutagen-capsule` webhook.
-- The kube-apiserver (as server) performs authentication checks on the dedicated
+- The kube-apiserver (as server) performs authorization checks on the dedicated
   service account and the principal requesting the token (the kube-apiserver as client,
-  in this case).
+  represented by its service account in this case).  The checks for the
+  `kube-system:webhook-auth` service account are:
+  1. The ability to create tokens for the `kube-system:webhook-auth` service account.
+  2. The `attest` permission on the `APIService` `"*"`.  This means that it can ask
+  any webhook any question about any object.  This is the out-of-the-box default permission
+  for the kube-apiserver service account. However, the `audience` on this token will be
+  set to this `mutagen-capsule` webhook.
 - The kube-apiserver will authenticate itself to the webhook.
 - The kube-apiserver will interrogate the webhook on behalf of the user.
 - The webhook will give the kube-apiserver the appropriate response regarding the
   user's Deployment creation, potentially mutating the request.
-- The kube-apiserver will then take the apporpriate action based on the mutating
+- The kube-apiserver will then take the appropriate action based on the mutating
   webhook's response.
 
 ```mermaid
 sequenceDiagram
-    actor User
-    participant KAS as kube-apiserver
+    actor Splinter as User (Splinter)
+    participant KAS as kube-apiserver<br/>(requester, issuer, caller)
     participant TokenReq as TokenRequest Handler<br/>(in-process)
     participant Authz as Authorization<br/>(in-process)
-    participant Webhook as Admission Webhook
+    participant Webhook as Admission Webhook<br/>(mutagen-capsule)
 
-    User->>KAS: Create Deployment
+    Splinter->>KAS: Create Deployment "ninja-turtles"
 
-    Note over KAS: Admission requires<br/>consulting webhook
+    Note over KAS: Admission requires<br/>consulting mutagen-capsule
 
     KAS->>KAS: Check WAT cache
     alt Cache miss or token expired
-        KAS->>TokenReq: TokenRequest for<br/>a dedicated SA token named kube-apiserver-sa-name with <br/>a BoundObjectRef:"MutatingWebhookConfiguration:mutagen-capsule"<br/>and the appropriate audience of http://mutagen-capsule.mutagen-capsule.svc:port/with/path.
+        KAS->>TokenReq: TokenRequest for SA "kube-system:webhook-auth"<br/>BoundObjectRef: MutatingWebhookConfiguration "mutagen-capsule"<br/>Audience: mutagen-capsule webhook URL
 
+        Note over TokenReq,Authz: Check caller (KAS SA) + dedicated SA
 
-        TokenReq->>Authz: Can caller "create"<br/>serviceaccounts/token for this SA?
+        TokenReq->>Authz: 1. Can caller "create"<br/>serviceaccounts/token for kube-system:webhook-auth?
         Authz-->>TokenReq: Allowed
 
-        TokenReq->>KAS: Does MutatingWebhookConfiguration "mutagen-capsule" exist?
+        TokenReq->>KAS: 2. Does MutatingWebhookConfiguration<br/>"mutagen-capsule" exist?
         KAS-->>TokenReq: Exists
 
-        TokenReq->>Authz: Does the dedicated SA have<br/>"attest" on APIService* "v1.apps.k8s.io"?
-        Authz-->>TokenReq: Allowed
+        TokenReq->>Authz: 3. Does kube-system:webhook-auth have<br/>"attest" on APIService "*"?
+        Authz-->>TokenReq: Allowed (default for KAS SA)
 
-        TokenReq-->>KAS: WAT issued (JWT with<br/>webhookAuthentication claims)
+        TokenReq-->>KAS: WAT issued (JWT, audience = mutagen-capsule)
         Note over KAS: Cache the WAT
     end
 
-    KAS->>Webhook: AdmissionReview request<br/>+ Authorization: Bearer <WAT>
+    KAS->>Webhook: AdmissionReview (Deployment)<br/>+ Authorization: Bearer <WAT>
 
     Note over Webhook: Verify JWT signature (OIDC discovery)
     Note over Webhook: Verify audience matches webhook identity
-    Note over Webhook: Verify APIService claims match<br/>resource in AdmissionReview body
 
-    Webhook-->>KAS: AdmissionReview response
-    KAS-->>User: Response
+    Webhook-->>KAS: AdmissionReview response<br/>(possibly mutating)
+    KAS-->>Splinter: Apply result of webhook response
 ```
 
 #### Flow 2: Aggregated API server authenticates to an admission webhook
 
-In this flow, the aggregated API server is a separate process. It
-authenticates to `kube-apiserver`, requests a WAT for its dedicated
-service account, and presents the token to the webhook. The WAT is bound
-to the APIService the aggregated API server serves.
+- A user named Splinter will attempt to create a `NinjaTurtle` named `leonardo`
+  on the cluster. `NinjaTurtle` belongs to the `ninja.turtle/v1` API, which is
+  served by an aggregated API server rather than directly by the kube-apiserver.
+- Unlike Flow 1, where the `kube-apiserver` played every role, this flow has two
+  server processes:
+  - the `kube-apiserver`, which is the token issuer and the authorizer, and
+  - a separate `aggregated API server`, which is the token requester and the
+    webhook caller.
+- The webhook is named `mutagen-capsule`.
+- The aggregated API server has its own dedicated Service Account named
+  `webhook-auth` (in the aggregated API server's namespace). Reuse of this
+  service account across aggregated API servers is discouraged.
+- When Splinter creates the `NinjaTurtle`, the kube-apiserver proxies the request
+  to the aggregated API server that serves `ninja.turtle/v1`.
+- The aggregated API server determines that admission requires consulting the
+  `mutagen-capsule` webhook, and so it needs a WAT in order to authenticate.
+- The aggregated API server authenticates to the kube-apiserver (typically with
+  its own service account token) and requests a WAT for its dedicated
+  `webhook-auth` service account. The request is for a token that is:
+  - bound to the `APIService` `v1.ninja.turtle` (via a `BoundObjectRef`), scoping
+    the token to the group/version the aggregated API server serves, and
+  - scoped to the `mutagen-capsule` webhook via the `audience`.
+- The kube-apiserver (as server) performs authorization checks on the dedicated
+  service account and the principal requesting the token (the aggregated API
+  server as client). The checks for the `webhook-auth` service account are:
+  1. The ability of the caller to create tokens for the `webhook-auth` service
+     account.
+  2. That the referenced `APIService` `v1.ninja.turtle` actually exists.
+  3. The `attest` permission for the `webhook-auth` service account on the
+     `APIService` `v1.ninja.turtle`. Unlike the kube-apiserver in Flow 1 (which
+     holds `attest` on `"*"`), the aggregated API server is granted `attest` only
+     on the specific APIService it serves, via an explicit ClusterRole and
+     binding.
+- The kube-apiserver issues the WAT (a JWT carrying the `webhookAuthentication`
+  claims for `v1.ninja.turtle`) and returns it to the aggregated API server,
+  which caches it per webhook + APIService.
+- The aggregated API server authenticates itself to the `mutagen-capsule` webhook
+  by presenting the WAT as a bearer token, and interrogates the webhook on behalf
+  of Splinter.
+- The webhook verifies the JWT signature (via OIDC discovery), that the audience
+  matches its own identity, and that the APIService claims (`v1.ninja.turtle`)
+  match the `NinjaTurtle` resource in the AdmissionReview body.
+- The webhook returns the appropriate response (potentially mutating `leonardo`),
+  the aggregated API server applies it and returns the result to the
+  kube-apiserver, which returns the final response to Splinter.
 
 ```mermaid
 sequenceDiagram
-    actor User
-    participant KAS as kube-apiserver
-    participant AAS as Aggregated API Server<br/>(serves engelbert.dev/v1)
+    actor Splinter as User (Splinter)
+    participant KAS as kube-apiserver<br/>(issuer, authorizer)
+    participant AAS as Aggregated API Server<br/>(serves ninja.turtle/v1)
     participant Authz as Authorization<br/>(in kube-apiserver)
     participant TokenReq as TokenRequest Handler<br/>(in kube-apiserver)
-    participant Webhook as Admission Webhook
+    participant Webhook as Admission Webhook<br/>(mutagen-capsule)
 
-    User->>KAS: Create Widget (engelbert.dev/v1)
+    Splinter->>KAS: Create NinjaTurtle "leonardo" (ninja.turtle/v1)
     KAS->>AAS: Proxy request to aggregated API server
 
-    Note over AAS: Admission requires<br/>consulting webhook
+    Note over AAS: Admission requires<br/>consulting mutagen-capsule
 
     AAS->>AAS: Check WAT cache<br/>(webhook + APIService)
     alt Cache miss or token expired
-        AAS->>KAS: Authenticate (e.g., own SA token)
+        AAS->>KAS: Authenticate (own SA token)
 
-        AAS->>KAS: TokenRequest for dedicated SA<br/>BoundObjectRef: APIService "v1.engelbert.dev"<br/>Audience: k8s.io:admission:<webhook-url>
+        AAS->>KAS: TokenRequest for SA "webhook-auth"<br/>BoundObjectRef: APIService "v1.ninja.turtle"<br/>Audience: mutagen-capsule webhook URL
 
-        KAS->>Authz: 1. Can caller "create"<br/>serviceaccounts/token for this SA?
+        KAS->>Authz: 1. Can caller "create"<br/>serviceaccounts/token for webhook-auth?
         Authz-->>KAS: Allowed (ClusterRole + binding)
 
-        KAS->>KAS: 2. Does APIService<br/>"v1.engelbert.dev" exist?
+        KAS->>KAS: 2. Does APIService<br/>"v1.ninja.turtle" exist?
         Note over KAS: Exists
 
-        KAS->>Authz: 3. Does the dedicated SA have<br/>"attest" on APIService "v1.engelbert.dev"?
+        KAS->>Authz: 3. Does webhook-auth have<br/>"attest" on APIService "v1.ninja.turtle"?
         Authz-->>KAS: Allowed (ClusterRole + binding)
 
         KAS->>TokenReq: Issue WAT
@@ -515,15 +562,15 @@ sequenceDiagram
         Note over AAS: Cache the WAT
     end
 
-    AAS->>Webhook: AdmissionReview request<br/>+ Authorization: Bearer <WAT>
+    AAS->>Webhook: AdmissionReview (NinjaTurtle)<br/>+ Authorization: Bearer <WAT>
 
     Note over Webhook: Verify JWT signature (OIDC discovery)
     Note over Webhook: Verify audience matches webhook identity
-    Note over Webhook: Verify APIService claims match<br/>resource in AdmissionReview body
+    Note over Webhook: Verify APIService claims (v1.ninja.turtle)<br/>match resource in AdmissionReview body
 
-    Webhook-->>AAS: AdmissionReview response
+    Webhook-->>AAS: AdmissionReview response<br/>(possibly mutating)
     AAS-->>KAS: Admission complete, return response
-    KAS-->>User: Response
+    KAS-->>Splinter: Apply result of webhook response
 ```
 
 ### Kube-apiserver Service Account Lifecycle
