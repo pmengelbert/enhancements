@@ -162,7 +162,8 @@ to keep the implementation practical for the most common use-cases.
   verification.
 * `kube-apiserver` authorizes webhook authentication clients at token issuance,
   and will refuse to provide a token to unauthorized principals.
-* Setting up permissions should be simple.
+* Setting up the requisite permissions for token acquisition should be simple
+  and easy.
 * The token is scoped to a subset of resources about which its bearer may
   contact the webhook.
 * Tokens may alternatively be scoped per-webhook (by audience).
@@ -188,7 +189,7 @@ the **Token Acquisition Service Account**. This is distinct from the identity
 that the principal requesting the token uses to authenticate itself to the
 Kubernetes API Server (which may or may not be a service account). The Token
 Acquisition Service Account must have `attest` permissions on the `APIService`
-object named in the `TokenRequest`. When the bound object in the .
+object named in the `TokenRequest` ().
 
 ### Webhook Authentication Client
 Because both `kube-apiserver` and aggregated API servers will attempt
@@ -203,6 +204,13 @@ When referring specifically to the Kubernetes API Server, the
 terms **`kube-apiserver`** and **Kubernetes API Server** will be used
 interchangeably. When referring specifically to an **Aggregated API Server**,
 the full term will always be used.
+
+### Webhook Authentication Bound Object Types
+The term **webhook authentication bound object types** will be used to refer
+to the three newly-added types considered valid as a `BoundObjectRef` in a
+`TokenRequest` where distinguishing between them is not important. Specifically,
+the new types recognized will be `APIService`, `ValidatingWebhookConfiguration`,
+and `MutatingWebhookConfiguration`.
 
 ## Proposal
 
@@ -243,24 +251,12 @@ it should deny `AdmissionReview` requests that pertain to objects within that
 potentially malicious aggregated API server from exposing a webhook's policy
 information or compromising it in some other way.
 
-### Token Verification
-
-The webhook may verify these tokens by taking the following steps:
-
-1. Verify the token's signature via the OIDC discovery endpoint.
-1. Verify that the token's audience matches the expected audience. This audience
-   is derived deterministically from the webhook url, and is in the format
-   is in the format `https://<url>/with/path`, where `<url>` matches that
-   specified in the webhook's configuration.
-1. Verify that the `APIGroup` and `APIVersion` encoded in the token's bound
-   `APIService` are either:
-   a. `"*"`, meaning the token is valid to this webhook for all resources, or
-   b. they match the `APIGroup` and `Version` of the resource in the body
-   of the `AdmissionReview` request.
+Following is more detail about requests for token acquisition, authorization
+checks by `kube-apiserver` at issuance, and webhook verification.
 
 ### Token Acquisition (client perspective)
 
-#### All webhook authentication clients
+#### All webhook authentication clients:
 
 When a [webhook authentication client](#webhook-authentication-client) needs
 to call an admission webhook about a given resource, it issues a `TokenRequest`
@@ -268,7 +264,7 @@ for its [token acquisition service account](#token-acquisition-service-account)
 to the Kubernetes API Server. The request includes:
 
 1. A `BoundObjectRef` pointing to either
-   a. the APIService corresponding to the resource being admitted (e.g. `v1.networking.k8s.io`), or
+   a. the `APIService` corresponding to the resource being admitted (e.g. `v1.networking.k8s.io`), or
    b. a `ValidatingWebhookConfiguration` or `MutatingWebhookConfiguration` object.
 1. The name of a [token acquisition service
    account](#token-acquisition-service-account) with `attest` permission on
@@ -293,47 +289,54 @@ doing so for a resource (or custom resource) it serves directly. The
 webhook it seeks to consult. In effect, this is a request for a token is
 valid for **a specific webhook** but for **all `APIService`s**.
 
-The token will be received only when the authorization checks (described below)
-succeed. When the principal is `kube-apiserver`, this will always succeed.
+The token will be received only when the authorization checks (described
+below) succeed. When the principal is `kube-apiserver`, this will always
+succeed under normal working conditions.
 
 #### Aggregated API Servers:
 When an aggregated API server needs to call an admission webhook, it requests
-a WSAT from the Kubernetes API Server. Each aggregated API server should
-have a dedicated service account for this purpose, as it must be named in
-the token request. The request flow is:
+a a service account token from the Kubernetes API Server. Each aggregated
+API server should have a dedicated service account for this purpose, as it
+must be named in the token request. The request flow is:
 
 1. The aggregated API server authenticates to the kube-apiserver using
-   whatever credential it is configured with. That principal must be
-   authorized to `create serviceaccount/token` in the relevant namespace,
-   with the appropriate resource name (i.e. that of the token acquisition
-   service account).
+   whatever credential it is configured with (which may or may not be a service
+   account). That principal must be authorized to `create serviceaccount/token`
+   in the relevant namespace, with the appropriate resource name (i.e. that
+   of the token acquisition service account).
 2. It sends a `TokenRequest` for its dedicated service account, with a
    `BoundObjectRef` pointing to the APIService it serves (e.g.,
    `v1.example.com`) and the appropriate audience.
 3. The kube-apiserver performs authorization checks (see below) and issues
-   the WSAT.
-4. The aggregated API server presents the WSAT to the webhook in its `Authorization` header.
+   the service account token.
+4. The aggregated API server presents the token to the webhook in its `Authorization` header.
 
-The token will be received only when the authorization checks (described below)
-succeed.
+The token will be received only when the authorization checks succeed. These
+are described in the next section.
 
-We expect each aggregated API server to have its own dedicated service
-account for obtaining WSATs. Reuse of these service accounts across
-aggregated API servers is discouraged.
+We expect each aggregated API server to have its own dedicated service account
+for obtaining tokens it will use to authenticate to webhooks. Reuse of these
+service accounts across multiple aggregated API servers is discouraged.
 
 ### Authorization Checks
 
-When the kube-apiserver receives a `TokenRequest` with an APIService as the
-`BoundObjectRef`, it performs the following checks:
+When `kube-apiserver` receives a `TokenRequest` with one of the [webhook
+authentication bound object types](#webhook-authentication-bound-object-types)
+as the `BoundObjectRef`, it performs the following checks:
 
 1. SAR check: Does the principal making the `TokenRequest` have `create` on
    `serviceaccounts/token` for the service account named in the request?
 1. Does the bound object (which may be an `APIService`, a
    `ValidatingWebhookConfiguration`, or a `MutatingWebhookConfiguration`)
    actually exist?
-1. SAR check: Does the [token acquisition service
-   account](#token-acquisition-service-account) in the request have the `attest`
-   permission on the referenced `APIService`, or on the wildcard `APIService`?
+1. SAR check:
+     a. when the bound object is an `APIService`, does the [token acquisition
+        service account](#token-acquisition-service-account) have the
+        `attest` permission on that `APIService`?
+     b. When the bound object is one of
+        `{Validating,Mutating}WebhookConfiguration`, does the [token acquisition
+        service account](#token-acuisition-service-account) have `attest`
+        permissions on the wildcard (`"*"`) `APIService`?
 
 The `SubjectAccessReview` (SAR) checks are performed via an
 `authorizer.Authorize()` call against the token acquisition service account's
@@ -343,6 +346,8 @@ The `attest` verb has precedent (it is already used in Kubernetes for
 ClusterTrustBundle signer attestation). To illustrate the permission model,
 the following RBAC configuration is given as an example. To paraphrase Donald
 Knuth, the example is baffling, but complete:
+
+<!-- TODO(pmengelbert): add example for per-webhook tokens -->
 
 ```yaml
 apiVersion: rbac.authorization.k8s.io/v1
@@ -399,6 +404,22 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
 ```
 
+### Token Verification
+
+The webhook may verify these tokens by taking the following steps:
+
+1. Verify the token's signature via the OIDC discovery endpoint.
+1. Verify that the token's audience matches the expected audience. This audience
+   is derived deterministically from the webhook url, and is in the format
+   is in the format `https://<url>/with/path`, where `<url>` matches that
+   specified in the webhook's configuration.
+1. Verify that the `APIGroup` and `APIVersion` encoded in the token's bound
+   `APIService` are either:
+   a. `"*"`, meaning the token is valid to this webhook for all resources, or
+   b. they match the `APIGroup` and `Version` of the resource in the body
+   of the `AdmissionReview` request.
+
+
 ### Audience
 
 The token's audience is the webhook's configured url.
@@ -422,7 +443,7 @@ the maximum of ten minutes.
 
 A webhook receiving a request with a WSAT performs the following checks:
 
-1. **Verify the JWT signature** using the kube-apiserver's OIDC discovery
+1. **Verify the JWT signature** using `kube-apiserver`'s OIDC discovery
    endpoint (`/.well-known/openid-configuration` and `/openid/v1/jwks`).
 2. **Verify the audience** matches the webhook's own identity.
 3. **Verify the APIService claim** in the token's private claims. The API
@@ -436,7 +457,7 @@ A webhook receiving a request with a WSAT performs the following checks:
 
 #### Story 1: Kube-apiserver authenticates to an admission webhook
 
-A user creates an `Ingress`. The kube-apiserver needs to consult a validating
+A user creates an `Ingress`. `kube-apiserver` needs to consult a validating
 admission webhook. It requests a WSAT from itself for its dedicated service
 account, bound to APIService `v1.networking.k8s.io` with an audience derived
 from the webhook's url. The webhook verifies the token and confirms that
@@ -447,13 +468,13 @@ the AdmissionReview body.
 
 A user creates a Widget resource (`example.com/v1`). The aggregated API
 server serving `example.com/v1` needs to consult a mutating admission
-webhook. It requests a WSAT from the kube-apiserver for its dedicated
-service account, bound to APIService `v1.example.com` with the
-webhook-derived audience. The kube-apiserver verifies that the caller can
-create tokens for the SA, that the APIService exists, and that the SA
-has `attest` permission on `v1.example.com`. The aggregated API server
-presents the WSAT to the webhook. The webhook verifies the token signature,
-audience, and confirms the claims match the Widget resource.
+webhook. It requests a service account token from `kube-apiserver` for its
+dedicated service account, bound to APIService `v1.example.com` with the
+webhook-derived audience. `kube-apiserver` verifies that the caller can
+create tokens for the SA, that the APIService exists, and that the SA has
+`attest` permission on `v1.example.com`. The aggregated API server presents
+the WSAT to the webhook. The webhook verifies the token signature, audience,
+and confirms the claims match the Widget resource.
 
 ### Risks and Mitigations
 
@@ -598,8 +619,8 @@ rules:
 
 ### Kube-apiserver Service Account Lifecycle
 
-The kube-apiserver uses a dedicated service account for requesting its own
-WSATs. A controller running in the kube-apiserver process (following the
+`kube-apiserver` uses a dedicated service account for requesting its own
+WSATs. A controller running in the `kube-apiserver` process (following the
 `ClusterAuthenticationTrustController` pattern) ensures this service account
 is recreated if deleted.
 
@@ -650,7 +671,7 @@ Unit tests will cover:
 
 - Feature implemented behind feature gates.
 - Initial unit and integration tests completed and enabled.
-- WSAT issuance and webhook presentation functional for kube-apiserver.
+- Webhook token issuance and webhook presentation functional for `kube-apiserver`.
 
 #### Beta
 
@@ -669,27 +690,27 @@ Unit tests will cover:
 ### Upgrade / Downgrade Strategy
 
 On upgrade to a version that enables the feature:
-- The kube-apiserver begins presenting WSATs to admission webhooks. Webhooks
-  that do not verify bearer tokens are unaffected, since the token is
-  presented as an `Authorization` header that the webhook can ignore.
+- `kube-apiserver` begins presenting bearer tokens to admission
+  webhooks. Webhooks that do not verify bearer tokens are unaffected, since the
+  token is presented as an `Authorization` header that the webhook can ignore.
 - Existing kubeconfig-based authentication setups continue to function.
 
 On downgrade or feature disablement:
-- The kube-apiserver stops presenting WSATs. Webhooks that have been
-  configured to require WSAT verification will reject requests. Operators
+- The kube-apiserver stops presenting bearer tokens. Webhooks that have been
+  configured to require token verification will reject requests. Operators
   must either re-enable the feature or reconfigure their webhooks.
 
 ### Version Skew Strategy
 
 This feature does not involve coordination between the control plane and
-nodes. It is contained entirely within the kube-apiserver and aggregated
+nodes. It is contained entirely within `kube-apiserver` and aggregated
 API servers.
 
-In a multi-replica HA cluster during rolling upgrade, some kube-apiserver
-replicas may present WSATs while others do not. Webhooks that require WSAT
-verification may see intermittent failures during the rollout window.
-Webhooks should be configured to require WSATs only after all replicas have
-been upgraded.
+In a multi-replica HA cluster during rolling upgrade, some `kube-apiserver`
+replicas may present bearer tokens to webhooks while others do not. Webhooks
+that require token verification may see intermittent failures during the
+rollout window.  Webhooks should be configured to require WSATs only after
+all replicas have been upgraded.
 
 ## Production Readiness Review Questionnaire
 
@@ -700,15 +721,15 @@ been upgraded.
 - [x] Feature gate (also fill in values in `kep.yaml`)
   - Feature gate name: `APIServerWebhookAuthenticationTokenIssuance`
   - Components depending on the feature gate:
-    - kube-apiserver
+    - `kube-apiserver`
 - [x] Feature gate (also fill in values in `kep.yaml`)
   - Feature gate name: `APIServerWebhookAuthenticationTokenVerification`
   - Components depending on the feature gate:
-    - kube-apiserver
+    - `kube-apiserver`
 
 ###### Does enabling the feature change any default behavior?
 
-Yes. When the issuance feature gate is enabled, the kube-apiserver will
+Yes. When the issuance feature gate is enabled, `kube-apiserver` will
 request a service account token (from itself) bound to the appropriate
 APIService for the resource in question and present it to the webhook as a
 bearer token. Webhooks that do not inspect the `Authorization` header will
@@ -721,7 +742,7 @@ of scope.
 ###### Can the feature be disabled once it has been enabled (i.e. can we roll back the enablement)?
 
 Yes. Disabling `APIServerWebhookAuthenticationTokenIssuance` and restarting
-the kube-apiserver will revert to the previous behavior. Webhooks that have
+`kube-apiserver` will revert to the previous behavior. Webhooks that have
 been configured to require the WSAT will begin rejecting requests, since the
 API server will no longer present a token.
 
@@ -797,10 +818,10 @@ latency from WSAT issuance is amortized by caching.
 - [x] Metrics
   - Metric name: `apiserver_admission_webhook_latency_seconds` (existing)
   - Aggregation method: 99th percentile
-  - Components exposing the metric: kube-apiserver
+  - Components exposing the metric: `kube-apiserver`
 - [x] Metrics
   - Metric name: `apiserver_admission_webhook_rejection_count` (existing)
-  - Components exposing the metric: kube-apiserver
+  - Components exposing the metric: `kube-apiserver`
 
 ###### Are there any missing metrics that would be useful to have to improve observability of this feature?
 
@@ -817,19 +838,19 @@ New metrics to add:
 ###### Does this feature depend on any specific services running in the cluster?
 
 No new dependencies. The feature uses the existing `TokenRequest` API and
-OIDC discovery endpoint, both of which are part of the kube-apiserver.
+OIDC discovery endpoint, both of which are part of `kube-apiserver`.
 
 ### Scalability
 
 ###### Will enabling / using this feature result in any new API calls?
 
-Yes. The kube-apiserver will make a `TokenRequest` API call
+Yes. `kube-apiserver` will make a `TokenRequest` API call
 (`create serviceaccounts/token`) prior to calling a webhook, when no valid
 cached token exists. Each request with an APIService `BoundObjectRef`
 triggers an additional authorization check (the `attest` verification). The
 APIService object is also fetched to verify it exists.
 
-Aggregated API servers will make the same calls to the kube-apiserver.
+Aggregated API servers will make the same calls to `kube-apiserver`.
 
 This additional load is mitigated by caching WSATs for their lifetime. Once
 a token is cached for a given webhook+APIService combination, no new API
@@ -849,7 +870,7 @@ of unique webhook+APIService combinations.
 ###### Will enabling / using this feature result in increasing size or count of the existing API objects?
 
 Yes. Each aggregated API server will have a dedicated service account for
-WSAT requests. The kube-apiserver will have an additional service account
+WSAT requests. `kube-apiserver` will have an additional service account
 for the same purpose. Additional RBAC roles and bindings will be needed.
 
 The JWT itself gains a new field in its private claims (`webhookAuthentication`)
@@ -876,11 +897,10 @@ No. This feature does not affect nodes.
 
 ###### How does this feature react if the API server and/or etcd is unavailable?
 
-If the kube-apiserver is unavailable, no webhook calls are made and the
-feature is moot. If etcd is unavailable, the dedicated service account and
-APIService objects cannot be read, and WSAT issuance will fail. Webhook
-calls will proceed without a WSAT (or fail, depending on the webhook's
-configuration).
+If `kube-apiserver` is unavailable, no webhook calls are made and the feature
+is moot. If etcd is unavailable, the dedicated service account and APIService
+objects cannot be read, and WSAT issuance will fail. Webhook calls will
+proceed without a WSAT (or fail, depending on the webhook's configuration).
 
 ###### What are other known failure modes?
 
@@ -888,9 +908,9 @@ configuration).
   - Detection: `apiserver_webhook_authentication_token_request_total` with
     failure label increases.
   - Mitigations: The in-process controller will recreate the service account
-    (for the kube-apiserver's own SA). For aggregated API servers, the
+    (for `kube-apiserver`'s own SA). For aggregated API servers, the
     operator must recreate the SA.
-  - Diagnostics: kube-apiserver logs will show token request failures.
+  - Diagnostics: `kube-apiserver` logs will show token request failures.
   - Testing: Integration tests cover SA deletion and recreation.
 
 - WSAT SA lacks `attest` permission
@@ -898,7 +918,7 @@ configuration).
     failure label increases. Webhook calls proceed without authentication
     or fail, depending on webhook configuration.
   - Mitigations: Grant the `attest` permission via RBAC.
-  - Diagnostics: kube-apiserver logs will show authorization denial for
+  - Diagnostics: `kube-apiserver` logs will show authorization denial for
     the `attest` check.
   - Testing: Integration tests cover missing `attest` permission.
 
@@ -920,7 +940,7 @@ configuration).
 4. Verify the dedicated SA exists and has the correct RBAC permissions.
 5. If the problem cannot be resolved, disable the
    `APIServerWebhookAuthenticationTokenIssuance` feature gate and restart
-   the kube-apiserver.
+   `kube-apiserver`.
 
 ## Implementation History
 
@@ -938,7 +958,7 @@ configuration).
 
 ### Client Certificates (mTLS)
 
-The kube-apiserver could authenticate to webhooks using client certificates
+`kube-apiserver` could authenticate to webhooks using client certificates
 (e.g., the existing front-proxy cert). This was considered but has drawbacks:
 L7 proxies terminate TLS and strip client certs, making this unreliable in
 common deployment topologies (service meshes, cloud load balancers, ingress
@@ -947,9 +967,9 @@ controllers). Bearer tokens survive L7 proxies because they are HTTP headers.
 ### Designated ServiceAccount ("Magic SA")
 
 A well-known service account name could represent the API server's identity.
-This was considered but rejected because it expands the semantic meaning of
-ServiceAccount from "workload identity" to "control-plane identity" and
-relies on a magic name convention rather than explicit authorization.
+This was considered but rejected because it expands the semantic meaning
+of ServiceAccount from "workload identity" to "control-plane identity"
+and relies on a magic name convention rather than explicit authorization.
 
 ### ServiceAccount Token with Identity in Private Claims
 
@@ -961,7 +981,7 @@ a specific API group/version, not just "is an API server").
 
 ### AdmissionReview Delegation
 
-Aggregated API servers could delegate admission to the kube-apiserver via a
+Aggregated API servers could delegate admission to `kube-apiserver` via a
 new AdmissionReview REST API. This was considered but rejected due to its
 large scope (requiring its own KEP and significant API surface) and because
 it would not address the kube-apiserver's own authentication to webhooks.
