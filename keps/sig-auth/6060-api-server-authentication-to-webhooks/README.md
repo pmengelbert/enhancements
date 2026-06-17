@@ -254,6 +254,239 @@ information or compromising it in some other way.
 Following is more detail about requests for token acquisition, authorization
 checks by `kube-apiserver` at issuance, and webhook verification.
 
+### Sequence Diagrams
+
+The following examples (with diagrams) illustrate the flows for token
+request, k8s authorization, issuance, and webhook authentication. There
+are two successful flows and one flow that fails at the time of webhook
+token verification.
+
+#### Flow 1: `kube-apiserver` as Webhook Client
+
+In this example, a user attempts to create a deployment named "ninja-turtles"
+(user request omitted from diagram). This requires review by the mutating
+admission webhook "mutagen-capsule". In order to authenticate itself to the
+webhook, `kube-apiserer` makes a `TokenRequest` for its dedicated service
+account `kube-system:webhook-auth`, bound to the `MutatingWebhookConfiguration`
+for the "mutagen-capsule" webhook. It binds the token to the webhook, rather
+than the `"v1.apps" APIService`, to avoid the burden of maintaining too
+many tokens. The `kube-system:webhook-auth` service account has `"attest"`
+permissions on the synthetic `"*"` `APIService`.
+
+```mermaid
+sequenceDiagram
+    participant TokenReq as TokenRequest Handler<br/>(kube-apiserver)
+    participant KAS as kube-apiserver<br/>(as AdmissionReview client)
+    participant Webhook as Admission Webhook<br/>(mutagen-capsule)
+
+    KAS->>KAS: Check token cache
+    alt Cache miss or token expired
+        KAS->>TokenReq: TokenRequest for "kube-system:webhook-auth"<br/>BoundObjectRef: MutatingWebhookConfiguration "mutagen-capsule"<br/>Audience: https://mutagen-capsule.default.svc/admission/review
+
+        TokenReq->>TokenReq: Authenticate client
+        Note over TokenReq: Authorization
+
+        TokenReq->>TokenReq: Can subject "create"<br/>serviceaccounts/token for kube-system:webhook-auth?
+        TokenReq->>TokenReq: Does MutatingWebhookConfiguration<br/>"mutagen-capsule" exist?
+        TokenReq->>TokenReq: Does kube-system:webhook-auth have<br/>"attest" on APIService "*"?
+
+        TokenReq-->>KAS: Token issued (see payload below)
+        Note over KAS: Cache JWT
+    end
+
+    Note over KAS,Webhook: AdmissionReview
+    KAS->>Webhook: AdmissionReview (Deployment)<br/>+ Authorization: Bearer <token><br/>(see payload below)
+
+    Note over Webhook: Verify JWT
+    Webhook->>Webhook: Check signature<br/>(OIDC discovery)<br/>
+    Webhook->>Webhook: Check audience
+    Webhook->>Webhook: Check bound objects<br/>Am I a mutating admission webhook?
+
+    Webhook-->>KAS: AdmissionReview response
+```
+
+##### JWT payload
+```json
+{
+  "sub": "kube-system:webhook-auth",
+  "aud": "https://mutagen-capsule.default.svc/admission/review",
+  <...>
+  "kubernetes.io": {
+      "mutatingWebhookConfiguration": {
+          "name": "mutagen-capusle",
+          "uid": "<uid>"
+      }
+  }
+}
+```
+
+#### Flow 2: `kube-apiserver` denies a suspicious request
+
+In this example, a compromised aggregated API server attempts to probe a
+validating webhook, "splinter-validate", for policy information. It wants
+to spam the webhook with `AdmissionReview` requests in an attempt to find
+principals that can read `Secret`s. To do so, it requests a JWT bound to the
+"splinter-validate" `ValidatingWebhookConfiguration`.
+
+```mermaid
+sequenceDiagram
+    participant KAS as kube-apiserver
+    participant AAS as Aggregated API Server<br/>(v1.ninja.turtles.ai)
+    participant Webhook as Mutating Webhook<br/>(mutagen-capsule)
+
+    KAS->>AAS: Delegate request to aggregated API server
+    AAS->>AAS: Needs admission review
+    AAS->>KAS: List webhooks
+    KAS-->>AAS: #%20;
+
+    AAS->>AAS: Check JWT cache
+    alt Cache miss
+        Note over KAS,AAS: Token Acquisition
+        AAS->>KAS: TokenRequest for "turtles-webhook-auth"<br/>BoundObjectRef: ValidatingWebhookConfiguration "splinter-validate"<br/>Audience: https://splinter-validate.default.svc/admission/review
+
+        KAS->>KAS: Authenticate client
+        Note over KAS: Authorization
+        KAS->>KAS: Can subject "create"<br/>serviceaccounts/token for turtles-webhook-auth?
+        KAS->>KAS: Does MutatingWebhookConfiguration<br/>"mutagen-capsule" exist?
+        KAS->>KAS: Does kube-system:webhook-auth have<br/>"attest" on APIService "*"?
+
+        KAS-->>AAS: 403 Forbidden
+    end
+
+    alt possibly
+        Note over AAS,Webhook: AdmissionReview
+        AAS->>Webhook: AdmissionReview request<br/>(no Authorization header)
+        Webhook-->>AAS: 401 Unauthorized
+    end
+```
+
+#### Flow 3: Webhook denies a suspicious request
+
+In this example, a compromised aggregated API server attempts to probe a
+validating webhook, "splinter-validate", for policy information. It wants
+to spam the webhook with `AdmissionReview` requests in an attempt to find
+principals that can read `Secret`s. The bodies of these `AdmissionReview`
+requests therefore pertain to `Secret` in the `"v1."` `APIService` (i.e. the
+core v1 API Group). The principal representing the aggregated API Server has
+`"attest"` permissions on the `v1.ninja.turles.ai` `APIService`.
+
+```mermaid
+sequenceDiagram
+    participant KAS as kube-apiserver<br/>(issuer, authorizer)
+    participant AAS as Compromised AAS
+    participant Webhook as Admission Webhook<br/>(splinter-validation)
+
+    KAS->>AAS: Delegate request to aggregated API server
+    AAS->>AAS: Needs admission review
+    AAS->>KAS: List webhooks
+    KAS-->>AAS: #%20;
+
+    AAS->>KAS: TokenRequest for SA "turtles-webhook-auth"<br/>BoundObjectRef: APIService "v1.ninja.turtles.ai".
+
+    AAS->>AAS: Check JWT cache
+    alt Cache miss
+        Note over KAS,AAS: Token Acquisition
+        AAS->>KAS: TokenRequest<br/>SA:"turles-webhook-auth"<br/>BoundObjectRef:"v1.ninja.turtles.ai"<br/>Audience:"https://splinter-validate.default.svc/admission/review"
+
+        Note over KAS: Authorization
+        KAS->>KAS: Can AAS principal "create"<br/>tokens for turtles-webhook-auth?
+        KAS->>KAS: APIService<br/>"v1.ninja.turtles.ai" exists?
+        KAS->>KAS: Does webhook-auth have<br/>"attest" on APIService "v1.ninja.turtles.ai"?
+
+        KAS-->>AAS: Issue JWT
+        AAS->>AAS: Cache JWT
+    end
+
+    Note over AAS,Webhook: AdmissionReview
+    AAS->>Webhook: AdmissionReview<br/>Authorization: Bearer <JWT>
+
+    Note over Webhook: Verify JWT
+    Webhook->>Webhook: Signature (OIDC discovery)? - OK
+    Webhook->>Webhook: Audience? - OK
+    Webhook-->>Webhook: APIService/AdmissionReview coherence?<br/>"v1.ninja.turtles.ai" ≠ "v1." - NO
+
+    Webhook-->>AAS: 403 Forbidden
+```
+
+##### JWT payload
+```json
+{
+  "sub": "kube-system:webhook-auth",
+  "aud": "https://splinter-validate.default.svc/admission/review",
+  <...>
+  "kubernetes.io": {
+      "apiService": {
+          "name": "v1.ninja.turtles.ai",
+          "uid": "<uid>"
+      }
+  }
+}
+```
+
+#### Flow 4: Successful Aggregated API Server flow
+
+In this example, a user attempts to create a `NinjaTurtle` named "leonardo"
+(user request omitted from diagram). The request is delegated to an aggregated
+API server that handles `NinjaTurtle` resources in the `ninja.turtles.ai`
+resource group, version `v1`. This requires review by the mutating admission
+webhook "mutagen-capsule". In order to authenticate itself to the webhook,
+the aggregated API server makes a `TokenRequest` for its dedicated service
+account `turtles-webhook-auth`, bound to the `APIService` `v1.ninja.turtles.ai`.
+The principal representing the aggregated API Server has `"attest"` permissions
+on the `v1.ninja.turles.ai` `APIService`.
+
+```mermaid
+sequenceDiagram
+    participant KAS as kube-apiserver
+    participant AAS as Aggregated API Server<br/>(v1.ninja.turtles.ai)
+    participant Webhook as Mutating Webhook<br/>(mutagen-capsule)
+
+    KAS->>AAS: Delegate request to aggregated API server
+    AAS->>AAS: Needs admission review
+    AAS->>KAS: List webhooks
+    KAS-->>AAS: #%20;
+
+    AAS->>AAS: Check JWT cache
+    alt JWT expired
+        Note over KAS,AAS: Token Acquisition
+        AAS->>KAS: TokenRequest<br/>SA:"turles-webhook-auth"<br/>BoundObjectRef:"v1.ninja.turtles.ai"<br/>Audience:"https://mutagen-capsule.default.svc/admission/review"
+
+        Note over KAS: Authorization
+        KAS->>KAS: Can AAS principal "create"<br/>tokens for turtles-webhook-auth?
+        KAS->>KAS: APIService<br/>"v1.ninja.turtles.ai" exists?
+        KAS->>KAS: Does webhook-auth have<br/>"attest" on APIService "v1.ninja.turtles.ai"?
+
+        KAS-->>AAS: Issue JWT
+        AAS->>AAS: Cache JWT
+    end
+
+    Note over AAS,Webhook: AdmissionReview
+    AAS->>Webhook: AdmissionReview<br/>+ Authorization: Bearer <token><br/>(see JWT payload below)
+
+    Note over Webhook: Verify Token
+    Webhook->>Webhook: Check signature<br/>(OIDC discovery)
+    Webhook->>Webhook: Check audience
+    Webhook->>Webhook: Check apiService claim<br/>is AdmissionReview about<br/>v1.ninja.turtles.ai?
+
+    Webhook-->>AAS: 200 OK
+    AAS-->>KAS: 200 OK
+```
+
+##### JWT payload
+```json
+{
+  "sub": "kube-system:webhook-auth",
+  "aud": "https://mutagen-capsule.default.svc/admission/review",
+  <...>
+  "kubernetes.io": {
+      "apiService": {
+          "name": "v1.ninja.turtles.ai",
+          "uid": "<uid>"
+      }
+  }
+}
+```
+
 ### Token Acquisition (client perspective)
 
 #### All webhook authentication clients:
