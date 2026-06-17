@@ -15,9 +15,6 @@
   - [Audience](#audience)
   - [Token Caching and Rotation](#token-caching-and-rotation)
   - [Webhook Verification](#webhook-verification)
-  - [User Stories](#user-stories)
-    - [Story 1: Kube-apiserver authenticates to an admission webhook](#story-1-kube-apiserver-authenticates-to-an-admission-webhook)
-    - [Story 2: Aggregated API server authenticates to an admission webhook](#story-2-aggregated-api-server-authenticates-to-an-admission-webhook)
   - [Risks and Mitigations](#risks-and-mitigations)
 - [Design Details](#design-details)
   - [New Private Claims](#new-private-claims)
@@ -251,8 +248,27 @@ it should deny `AdmissionReview` requests that pertain to objects within that
 potentially malicious aggregated API server from exposing a webhook's policy
 information or compromising it in some other way.
 
-Following is more detail about requests for token acquisition, authorization
-checks by `kube-apiserver` at issuance, and webhook verification.
+The `TokenRequest` handler will be updated to accommodate the three new
+kinds of bound object. When one of them is used, it will trigger additional
+authorization checks (described in another section below).
+
+Webhook libraries will be updated to optionally (and eventually always) require a bearer token. The webhook then verifies these tokens by taking the following steps:
+
+1. Verify the token's signature via the OIDC discovery endpoint.
+1. Verify that the token's audience matches the expected audience. This audience
+   is derived deterministically from the webhook url, and is in the format
+   `https://<url>/with/path`, where `<url>` matches the one specified in
+   the webhook's configuration.
+1. Verify that the JWT is bound to one (and only
+   one) of the [webhook authentication bound object
+   types](#webhook-authentication-bound-object-types), and
+     a. When the bound object is a `ValidatingWebhookConfiguration`, reject
+        the request if the webhook is not a validating admission webhook.
+     b. When the bound object is a `MutatingWebhookConfiguration`, reject
+        the request if the webhook is not a mutating admission webhook.
+     c. When the bound object is an `APIService`, reject the request if
+        the resource named in the `AdmissionReview` request body is not a member
+        of the `APIGroup` and `APIVersion` corresponding to that `APIService`.
 
 ### Sequence Diagrams
 
@@ -313,7 +329,7 @@ sequenceDiagram
   <...>
   "kubernetes.io": {
       "mutatingWebhookConfiguration": {
-          "name": "mutagen-capusle",
+          "name": "mutagen-capsule",
           "uid": "<uid>"
       }
   }
@@ -436,7 +452,40 @@ sequenceDiagram
 }
 ```
 
-### Token Acquisition (client perspective)
+
+### Risks and Mitigations
+
+#### Token replay across webhooks
+
+A JWT obtained for one webhook could be presented to another webhook if they
+serve overlapping resources. The per-webhook audience scoping prevents this:
+each token is only valid for the specific webhook audience for which it
+was minted.
+
+#### Token replay across API groups
+
+A token bound to one APIService could be presented when admitting a resource
+from a different API group. The webhook's verification of the APIService
+claims against the AdmissionReview body prevents this: the group and version
+must match.
+
+#### Service account compromise
+
+If a service account is compromised, an attacker could request tokens and
+impersonate an aggregated API server to webhooks. The dedicated-SA-per-server
+model limits the impact of such a compromise. The `attest` check, properly
+applied to only the resources controlled by the aggregated API server,
+prevents the service account from even obtaining a token for other uses.
+
+#### Increased authorization load
+
+Each  request triggers an additional authorization check (the `attest`
+verification). This is mitigated by caching: tokens are cached for their
+lifetime, so the authorization check is amortized over many webhook calls.
+
+## Design Details
+
+### Token Acquisition (from the client perspective)
 
 #### All webhook authentication clients:
 
@@ -471,15 +520,15 @@ doing so for a resource (or custom resource) it serves directly. The
 webhook it seeks to consult. In effect, this is a request for a token is
 valid for **a specific webhook** but for **all `APIService`s**.
 
-The token will be received only when the authorization checks (described
-below) succeed. When the principal is `kube-apiserver`, this will always
-succeed under normal working conditions.
+The requester will only receive the JWT token when the authorization checks
+(described below) succeed. When the principal is `kube-apiserver`, this will
+always succeed under normal working conditions.
 
 #### Aggregated API Servers:
 When an aggregated API server needs to call an admission webhook, it requests
-a a service account token from the Kubernetes API Server. Each aggregated
-API server should have a dedicated service account for this purpose, as it
-must be named in the token request. The request flow is:
+a service account token from the Kubernetes API Server. Each aggregated API
+server should have a dedicated service account for this purpose, as it must
+be named in the token request. The request flow is:
 
 1. The aggregated API server authenticates to the kube-apiserver using
    whatever credential it is configured with (which may or may not be a service
@@ -506,12 +555,12 @@ When `kube-apiserver` receives a `TokenRequest` with one of the [webhook
 authentication bound object types](#webhook-authentication-bound-object-types)
 as the `BoundObjectRef`, it performs the following checks:
 
-1. SAR check: Does the principal making the `TokenRequest` have `create` on
+1. Does the principal making the `TokenRequest` have `create` on
    `serviceaccounts/token` for the service account named in the request?
 1. Does the bound object (which may be an `APIService`, a
    `ValidatingWebhookConfiguration`, or a `MutatingWebhookConfiguration`)
    actually exist?
-1. SAR check:
+1. Service account check:
      a. when the bound object is an `APIService`, does the [token acquisition
         service account](#token-acquisition-service-account) have the
         `attest` permission on that `APIService`?
@@ -526,10 +575,7 @@ identity.
 
 The `attest` verb has precedent (it is already used in Kubernetes for
 ClusterTrustBundle signer attestation). To illustrate the permission model,
-the following RBAC configuration is given as an example. To paraphrase Donald
-Knuth, the example is baffling, but complete:
-
-<!-- TODO(pmengelbert): add example for per-webhook tokens -->
+the following RBAC configurations are given as an example.
 
 ```yaml
 apiVersion: rbac.authorization.k8s.io/v1
@@ -549,7 +595,7 @@ metadata:
   name: binding-to-let-you-create-serviceaccount-tokens
   namespace: in-the-relevant-namespace
 subjects:
-  - name: principal-requesting-a-wat
+  - name: principal-requesting-a-token
     apiGroup: rbac.authorization.k8s.io
     kind: # Could be any of ServiceAccount | User | Group
 roleRef:
@@ -557,7 +603,7 @@ roleRef:
   name: let-me-create-webhook-authentication-tokens
   apiGroup: rbac.authorization.k8s.io
 
---
+---
 
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -586,21 +632,28 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
 ```
 
-### Token Verification
+### New types of BoundObjectRef
 
-The webhook may verify these tokens by taking the following steps:
+The `TokenRequest` API's `BoundObjectRef` is extended to accept `APIService`,
+`ValidatingWebhookConfiguration`, and `MutatingWebhookConfiguration` as
+valid object reference kinds. The token becomes invalid if the referenced
+`APIService` or `*WebhookConfiguration` is deleted.
 
-1. Verify the token's signature via the OIDC discovery endpoint.
-1. Verify that the token's audience matches the expected audience. This audience
-   is derived deterministically from the webhook url, and is in the format
-   is in the format `https://<url>/with/path`, where `<url>` matches that
-   specified in the webhook's configuration.
-1. Verify that the `APIGroup` and `APIVersion` encoded in the token's bound
-   `APIService` are either:
-   a. `"*"`, meaning the token is valid to this webhook for all resources, or
-   b. they match the `APIGroup` and `Version` of the resource in the body
-   of the `AdmissionReview` request.
+#### Synthetic `"*"` APIService
 
+When a requester makes a `TokenRequest` bound to one of the
+`WebhookConfiguration` types, the service account for which the token is
+requested must have `"attest"` on the synthetic `"*"` `APIService`. This is not
+a real `APIService`, but is used to express the elevated permissions required
+to obtain a token bound to a *webhook*, for which there is no restriction
+on the `APIService` that the bearer of the token may ask admission questions
+about. This was introduced to this KEP after it was pointed out that caching
+tokens per webhook+APIService combination. The number of tokens in that case
+would be a burden for `kube-apiserver` in particular.
+
+As such, the KEP authors recommend that **only `kube-apiserver`** should be
+granted `"attest"` on `"*"`. Aggregated API servers should instead be granted
+`"attest"` on those `APIService`s over which they have control.
 
 ### Audience
 
@@ -609,100 +662,17 @@ The token's audience is the webhook's configured url.
 The webhook verifies that the token's `aud` claim matches its configured
 identity before accepting the request.
 
-### Token Caching and Rotation
+### New JWT Private Claims
 
-When the bound object is an `APIService`, WSATs are cached per
-combination of webhook and `APIService`. When the bound object is a
-`ValidatingWebhookConfiguration` or `MutatingWebhookConfiguration`, the
-WSAT will be cached per-webhook. When a cached token has expired, the next
-webhook call for that combination triggers a new `TokenRequest`. Tokens
-will expire after 10 minutes, or some shorter duration specified by the
-user via the `TokenRequest`'s `expirationSeconds`. A request containing
-`expirationSeconds` longer than ten minutes will be silently shortened to
-the maximum of ten minutes.
-
-### Webhook Verification
-
-A webhook receiving a request with a WSAT performs the following checks:
-
-1. **Verify the JWT signature** using `kube-apiserver`'s OIDC discovery
-   endpoint (`/.well-known/openid-configuration` and `/openid/v1/jwks`).
-2. **Verify the audience** matches the webhook's own identity.
-3. **Verify the APIService claim** in the token's private claims. The API
-   group and version encoded in the APIService name must match the group
-   and version of the resource described in the AdmissionReview request body.
-   If they do not match, the webhook should reject the request, because the
-   token only authorizes the caller to consult the webhook about resources in
-   the API group and version named in the token.
-
-### User Stories
-
-#### Story 1: Kube-apiserver authenticates to an admission webhook
-
-A user creates an `Ingress`. `kube-apiserver` needs to consult a validating
-admission webhook. It requests a WSAT from itself for its dedicated service
-account, bound to APIService `v1.networking.k8s.io` with an audience derived
-from the webhook's url. The webhook verifies the token and confirms that
-the API group and version in the claims match those of the Pod resource in
-the AdmissionReview body.
-
-#### Story 2: Aggregated API server authenticates to an admission webhook
-
-A user creates a Widget resource (`example.com/v1`). The aggregated API
-server serving `example.com/v1` needs to consult a mutating admission
-webhook. It requests a service account token from `kube-apiserver` for its
-dedicated service account, bound to APIService `v1.example.com` with the
-webhook-derived audience. `kube-apiserver` verifies that the caller can
-create tokens for the SA, that the APIService exists, and that the SA has
-`attest` permission on `v1.example.com`. The aggregated API server presents
-the WSAT to the webhook. The webhook verifies the token signature, audience,
-and confirms the claims match the Widget resource.
-
-### Risks and Mitigations
-
-#### Token replay across webhooks
-
-A WSAT obtained for one webhook could be presented to another webhook if
-they serve overlapping resources. The per-webhook audience scoping prevents
-this: each token is only valid for the specific webhook audience it was
-minted for.
-
-#### Token replay across API groups
-
-A WSAT bound to one APIService could be presented when admitting a resource
-from a different API group. The webhook's verification of the APIService
-claims against the AdmissionReview body prevents this: the group and version
-must match.
-
-#### Service account compromise
-
-If a WSAT service account is compromised, an attacker could request WSATs and
-impersonate the API server to webhooks. The dedicated-SA-per-server model
-limits the blast radius. The `attest` check ensures that even with token
-creation permission, the SA must be explicitly authorized for the specific
-APIService.
-
-#### Increased authorization load
-
-Each WSAT request triggers an additional authorization check (the `attest`
-verification). This is mitigated by caching: WSATs are cached for their
-lifetime, so the authorization check is amortized over many webhook calls.
-
-## Design Details
-
-### New Private Claims
-
-WSATs include the following new fields in the `kubernetes.io` private claims
-of the JWT:
+Tokens intended for authenticating to webhooks include the following new
+fields in the `kubernetes.io` private claims of the JWT:
 
 ```json
 {
   "kubernetes.io": {
-    "webhookAuthentication": {
-      "apiService": {
-        "name": "v1.example.com",
-        "uid": "44e818f2-2ad0-4432-9816-3a649ca9945c"
-      }
+    "apiService": {
+      "name": "v1.example.com",
+      "uid": "44e818f2-2ad0-4432-9816-3a649ca9945c"
     }
   }
 }
@@ -712,99 +682,68 @@ The `name` field encodes the API version and group in the standard
 `<version>.<group>` format. The `uid` field is the UID of the APIService
 object at the time the token was issued.
 
-### BoundObjectRef for APIService
+or
 
-The `TokenRequest` API's `BoundObjectRef` is extended to accept `APIService`
-as a valid object reference kind. This follows the existing pattern for
-binding tokens to Pods, Nodes, and Secrets. The token becomes invalid if
-the referenced APIService is deleted.
-
-### RBAC Configuration
-
-For an aggregated API server serving `example.com/v1`, the following
-RBAC configuration is needed:
-
-1. A dedicated service account (e.g., `webhook-token-acquisition-service-account` in the aggregated
-   API server's namespace).
-
-2. The aggregated API server's principal needs `create` on
-   `serviceaccounts/token` for the dedicated SA:
-
-```yaml
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: let-me-create-webhook-authentication-tokens
-rules:
-  - apiGroups: [""]
-    resources: ["serviceaccount/token"]
-    resourceName: webhook-token-acquisition-service-account
-    verbs: ["create"]
-
----
-
-kind: RoleBinding
-metadata:
-  name: binding-to-let-you-create-serviceaccount-tokens
-  namespace: in-the-relevant-namespace
-subjects:
-  - name: principal-requesting-a-wat
-    apiGroup: rbac.authorization.k8s.io
-    kind: # Could be any of ServiceAccount | User | Group
-roleRef:
-  kind: Role
-  name: let-me-create-webhook-authentication-tokens
-  apiGroup: rbac.authorization.k8s.io
-
---
-
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: let-the-webhook-token-acquisition-service-account-request-tokens-bound-to-an-api-service
-rules:
-  - apiGroups: ["apiregistration.k8s.io"]
-    resources: ["apiservices"]
-    resourceName: "v1.example.com"
-    verbs: ["attest"]
-
----
-
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: cluster-binding-to-let-you-get-webhook-authentication-tokens
-subjects:
-  - kind: ServiceAccount
-    name: webhook-token-acquisition-service-account
-    namespace: in-the-relevant-namespace
-    apiGroup: rbac.authorization.k8s.io
-roleRef:
-  kind: ClusterRole
-  name: let-the-webhook-token-acquisition-service-account-request-tokens-bound-to-an-api-service
-  apiGroup: rbac.authorization.k8s.io
+```json
+{
+  "kubernetes.io": {
+    "mutatingWebhookConfiguration": {
+      "name": "mutagen-capsule",
+      "uid": "44e818f2-2ad0-4432-9816-3a649ca9945c"
+    }
+  }
+}
 ```
 
-3. The dedicated SA needs `attest` on the APIService:
+or
 
-```yaml
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: engelbert-webhook-attest
-rules:
-- apiGroups: ["apiregistration.k8s.io"]
-  resources: ["apiservices"]
-  resourceNames: ["v1.example.com"]
-  verbs: ["attest"]
+```json
+{
+  "kubernetes.io": {
+    "validatingWebhookConfiguration": {
+      "name": "splinter-validate",
+      "uid": "44e818f2-2ad0-4432-9816-3a649ca9945c"
+    }
+  }
+}
 ```
 
-### Kube-apiserver Service Account Lifecycle
+Where the `mutatingWebhookConfiguration` or `validatingWebhookConfiguration`
+does not match the type of webhook receiving the token, the request should
+be rejected.
 
-`kube-apiserver` uses a dedicated service account for requesting its own
-WSATs. A controller running in the `kube-apiserver` process (following the
-`ClusterAuthenticationTrustController` pattern) ensures this service account
-is recreated if deleted.
+### Token Verification
+
+The webhook may verify these tokens by taking the following steps:
+
+1. Verify the token's signature via the OIDC discovery endpoint.
+1. Verify that the token's audience matches the expected audience. This audience
+   is derived deterministically from the webhook url, and is in the format
+   `https://<url>/with/path`, where `<url>` matches the one specified in
+   the webhook's configuration.
+1. Verify that the JWT is bound to one (and only
+   one) of the [webhook authentication bound object
+   types](#webhook-authentication-bound-object-types), and
+     a. When the bound object is a `ValidatingWebhookConfiguration`, reject
+        the request if the webhook is not a validating admission webhook.
+     b. When the bound object is a `MutatingWebhookConfiguration`, reject
+        the request if the webhook is not a mutating admission webhook.
+     c. When the bound object is an `APIService`, reject the request if
+        the resource named in the `AdmissionReview` request body is not a member
+        of the `APIGroup` and `APIVersion` corresponding to that `APIService`.
+
+
+### Token Caching and Rotation
+
+When the bound object is an `APIService`, serviceaccount tokens for
+authentication to webhooks are cached per combination of webhook and
+`APIService`. When the bound object is a `ValidatingWebhookConfiguration` or
+`MutatingWebhookConfiguration`, the token will be cached per-webhook. When
+a cached token has expired, the next webhook call for that combination
+triggers a new `TokenRequest`. Tokens will expire after 10 minutes,
+or some shorter duration specified by the user via the `TokenRequest`'s
+`expirationSeconds`. A request containing `expirationSeconds` longer than
+ten minutes will be silently shortened to the maximum of ten minutes.
 
 ### Test Plan
 
@@ -825,14 +764,14 @@ None identified at this time.
 Unit tests will cover:
 - TokenRequest with APIService BoundObjectRef issues correct private claims.
 - The `attest` authorization check is performed and enforced.
-- The webhook dispatch path attaches the WSAT as a bearer token when the
+- The webhook dispatch path attaches the token as a bearer token when the
   feature gate is enabled.
 - The webhook dispatch path does not attach a token when the feature gate
   is disabled.
 
 ##### Integration tests
 
-- WSAT issuance and webhook dispatch end-to-end with a test webhook that
+- Token issuance and webhook dispatch end-to-end with a test webhook that
   verifies token claims.
 - Rejection when the SA lacks `attest` permission.
 - Rejection when the referenced APIService does not exist.
@@ -843,22 +782,24 @@ Unit tests will cover:
 ##### e2e tests
 
 - An aggregated API server authenticates to an admission webhook using a
-  WSAT.
+  JWT bound to each of the three new types.
 - A webhook rejects a request where the APIService claims do not match the
   resource in the AdmissionReview body.
+- A webhook rejects a request where the bound object does not match the webhook type.
 
 ### Graduation Criteria
 
 #### Alpha
 
 - Feature implemented behind feature gates.
-- Initial unit and integration tests completed and enabled.
+- Webhook verification library.
 - Webhook token issuance and webhook presentation functional for `kube-apiserver`.
+- Webhook issuance and webhook presentation functional for aggregated API
+  servers.
+- Initial unit and integration tests completed and enabled.
 
 #### Beta
 
-- WSAT issuance and webhook presentation functional for aggregated API
-  servers.
 - All unit, integration, and e2e tests passing and stable.
 - Feedback from early adopters incorporated.
 - All known issues and gaps resolved.
@@ -867,7 +808,6 @@ Unit tests will cover:
 
 - At least two releases since beta with no regressions.
 - Conformance tests added.
-- Webhook verification library or documentation available.
 
 ### Upgrade / Downgrade Strategy
 
@@ -891,7 +831,7 @@ API servers.
 In a multi-replica HA cluster during rolling upgrade, some `kube-apiserver`
 replicas may present bearer tokens to webhooks while others do not. Webhooks
 that require token verification may see intermittent failures during the
-rollout window.  Webhooks should be configured to require WSATs only after
+rollout window.  Webhooks should be configured to require bearer tokens only after
 all replicas have been upgraded.
 
 ## Production Readiness Review Questionnaire
@@ -925,8 +865,8 @@ of scope.
 
 Yes. Disabling `APIServerWebhookAuthenticationTokenIssuance` and restarting
 `kube-apiserver` will revert to the previous behavior. Webhooks that have
-been configured to require the WSAT will begin rejecting requests, since the
-API server will no longer present a token.
+been configured to require the bearer token will begin rejecting requests,
+since the API server will no longer present a token.
 
 ###### What happens if we reenable the feature if it was previously rolled back?
 
@@ -936,7 +876,7 @@ is required.
 ###### Are there any tests for feature enablement/disablement?
 
 Unit tests will verify that when the feature gate is enabled, the webhook
-dispatch path presents a WSAT. When the feature gate is disabled, no token
+dispatch path presents a token. When the feature gate is disabled, no token
 is presented. Integration tests will exercise the full webhook call path
 with the feature gate toggled on and off.
 
@@ -944,15 +884,15 @@ with the feature gate toggled on and off.
 
 ###### How can a rollout or rollback fail? Can it impact already running workloads?
 
-During rollout in a multi-replica HA cluster, some replicas may present WSATs
-while others do not. Webhooks that require WSATs may see intermittent failures
+During rollout in a multi-replica HA cluster, some replicas may present tokens
+while others do not. Webhooks that require tokens may see intermittent failures
 from replicas that have not yet been upgraded. This does not affect already
-running workloads directly, but it affects admission of new or modified objects
-during the rollout window.
+running workloads directly, but it affects admission of new or modified
+objects during the rollout window.
 
-On rollback, webhooks that were configured to require WSATs will reject all
-requests. Operators should reconfigure webhooks before or immediately after
-rollback.
+On rollback, webhooks that were configured to require bearer tokens will reject
+all requests. Operators should reconfigure webhooks before or immediately
+after rollback.
 
 ###### What specific metrics should inform a rollback?
 
@@ -980,7 +920,7 @@ deprecated.
 
 The feature is not workload-facing. It is a control plane behavior. An
 operator can determine the feature is active by checking the kube-apiserver
-feature gate configuration and by observing WSAT-related metrics (see below).
+feature gate configuration and by observing JWT-related metrics (see below).
 
 ###### How can someone using this feature know that it is working for their instance?
 
@@ -993,7 +933,7 @@ feature gate configuration and by observing WSAT-related metrics (see below).
 ###### What are the reasonable SLOs (Service Level Objectives) for the enhancement?
 
 Use of this feature should not change existing API SLOs. The additional
-latency from WSAT issuance is amortized by caching.
+latency from token issuance is amortized by caching.
 
 ###### What are the SLIs (Service Level Indicators) an operator can use to determine the health of the service?
 
@@ -1008,12 +948,14 @@ latency from WSAT issuance is amortized by caching.
 ###### Are there any missing metrics that would be useful to have to improve observability of this feature?
 
 New metrics to add:
-- `apiserver_webhook_authentication_token_request_total`: counter of WSAT
-  requests, labeled by success/failure.
+- `apiserver_webhook_authentication_token_request_total`: counter of
+  `TokenReview` requests containing a `BoundObjectRef` to one of the webhook
+  authentication bound object types.
 - `apiserver_webhook_authentication_token_request_duration_seconds`:
-  histogram of WSAT request latency.
+  histogram of token request latency, for tokens used to authenticate to
+  webhooks.
 - `apiserver_webhook_authentication_token_cache_hit_total`: counter of
-  cache hits when looking up cached WSATs.
+  cache hits when looking up cached webhook authentication tokens.
 
 ### Dependencies
 
@@ -1034,7 +976,7 @@ APIService object is also fetched to verify it exists.
 
 Aggregated API servers will make the same calls to `kube-apiserver`.
 
-This additional load is mitigated by caching WSATs for their lifetime. Once
+This additional load is mitigated by caching tokens for their lifetime. Once
 a token is cached for a given webhook+APIService combination, no new API
 calls are needed until the token expires.
 
@@ -1052,7 +994,7 @@ of unique webhook+APIService combinations.
 ###### Will enabling / using this feature result in increasing size or count of the existing API objects?
 
 Yes. Each aggregated API server will have a dedicated service account for
-WSAT requests. `kube-apiserver` will have an additional service account
+token requests. `kube-apiserver` will have an additional service account
 for the same purpose. Additional RBAC roles and bindings will be needed.
 
 The JWT itself gains a new field in its private claims (`webhookAuthentication`)
@@ -1067,9 +1009,9 @@ cost is amortized over the token's lifetime.
 
 ###### Will enabling / using this feature result in non-negligible increase of resource usage (CPU, RAM, disk, IO, ...) in any components?
 
-Minimal increase in memory for the WSAT cache (one JWT per
-webhook+APIService combination). CPU impact from token signing is negligible
-and amortized by caching.
+Minimal increase in memory for the token cache (one JWT per webhook for
+`kube-apiserver`, one JWT per webhook+APIService combination for aggregated API
+servers). CPU impact from token signing is negligible and amortized by caching.
 
 ###### Can enabling / using this feature result in resource exhaustion of some node resources (PIDs, sockets, inodes, etc.)?
 
@@ -1081,30 +1023,29 @@ No. This feature does not affect nodes.
 
 If `kube-apiserver` is unavailable, no webhook calls are made and the feature
 is moot. If etcd is unavailable, the dedicated service account and APIService
-objects cannot be read, and WSAT issuance will fail. Webhook calls will
-proceed without a WSAT (or fail, depending on the webhook's configuration).
+objects cannot be read, and token issuance will fail. Webhook calls will
+proceed without a token (or fail, depending on the webhook's configuration).
 
 ###### What are other known failure modes?
 
-- WSAT service account is deleted
+- `kube-apiserver` token service account is deleted
   - Detection: `apiserver_webhook_authentication_token_request_total` with
     failure label increases.
-  - Mitigations: The in-process controller will recreate the service account
-    (for `kube-apiserver`'s own SA). For aggregated API servers, the
-    operator must recreate the SA.
+  - Mitigations: `kube-apiserver` will need to be restarted, in order for
+    the service account to be recreated as part of the boostrapping process.
   - Diagnostics: `kube-apiserver` logs will show token request failures.
   - Testing: Integration tests cover SA deletion and recreation.
 
-- WSAT SA lacks `attest` permission
+- Token acquisition service account lacks `attest` permission
   - Detection: `apiserver_webhook_authentication_token_request_total` with
     failure label increases. Webhook calls proceed without authentication
     or fail, depending on webhook configuration.
-  - Mitigations: Grant the `attest` permission via RBAC.
+  - Mitigations: Grant the `attest` permission.
   - Diagnostics: `kube-apiserver` logs will show authorization denial for
     the `attest` check.
   - Testing: Integration tests cover missing `attest` permission.
 
-- Webhook rejects WSAT due to claims mismatch
+- Webhook rejects token due to claims mismatch
   - Detection: `apiserver_admission_webhook_rejection_count` increases.
   - Mitigations: Verify that the webhook is correctly matching the
     APIService claims against the resource in the AdmissionReview body.
@@ -1113,7 +1054,7 @@ proceed without a WSAT (or fail, depending on the webhook's configuration).
 
 ###### What steps should be taken if SLOs are not being met to determine the problem?
 
-1. Check `apiserver_webhook_authentication_token_request_total` for WSAT
+1. Check `apiserver_webhook_authentication_token_request_total` for token
    request failures.
 2. Check `apiserver_admission_webhook_rejection_count` for webhook
    rejections.
@@ -1128,12 +1069,12 @@ proceed without a WSAT (or fail, depending on the webhook's configuration).
 
 ## Drawbacks
 
-- Additional authorization checks on each WSAT request add some overhead,
+- Additional authorization checks on each token request add some overhead,
   though this is mitigated by caching.
 - Webhook authors need to implement token verification to benefit from the
   feature, though a verification library will be provided.
 - The feature introduces a new use of the `attest` verb and extends the
-  `BoundObjectRef` to support APIService, adding surface area to the
+  `BoundObjectRef` to support three new types, adding surface area to the
   TokenRequest API.
 
 ## Alternatives
