@@ -67,17 +67,17 @@
 Items marked with (R) are required *prior to targeting to a milestone / release*.
 
 - [x] (R) Enhancement issue in release milestone, which links to KEP dir in [kubernetes/enhancements] (not the initial KEP PR)
-- [ ] (R) KEP approvers have approved the KEP status as `implementable`
-- [ ] (R) Design details are appropriately documented
-- [ ] (R) Test plan is in place, giving consideration to SIG Architecture and SIG Testing input (including test refactors)
+- [x] (R) KEP approvers have approved the KEP status as `implementable`
+- [x] (R) Design details are appropriately documented
+- [x] (R) Test plan is in place, giving consideration to SIG Architecture and SIG Testing input (including test refactors)
   - [ ] e2e Tests for all Beta API Operations (endpoints)
   - [ ] (R) Ensure GA e2e tests meet requirements for [Conformance Tests](https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/conformance-tests.md)
   - [ ] (R) Minimum Two Week Window for GA e2e tests to prove flake free
-- [ ] (R) Graduation criteria is in place
+- [ x (R) Graduation criteria is in place
   - [ ] (R) [all GA Endpoints](https://github.com/kubernetes/community/pull/1806) must be hit by [Conformance Tests](https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/conformance-tests.md) within one minor version of promotion to GA
-- [ ] (R) Production readiness review completed
-- [ ] (R) Production readiness review approved
-- [ ] "Implementation History" section is up-to-date for milestone
+- [x] (R) Production readiness review completed
+- [x] (R) Production readiness review approved
+- [x] "Implementation History" section is up-to-date for milestone
 - [ ] User-facing documentation has been created in [kubernetes/website], for publication to [kubernetes.io]
 - [ ] Supporting documentation---e.g., additional design documents, links to mailing list discussions/SIG meetings, relevant PRs/issues, release notes
 
@@ -124,21 +124,24 @@ through `--admission-control-config-file`), but they require manual credential
 management and an API server restart to change. That opt-in mechanism is
 unopinionated as to the method of authentication (mTLS / token / basic auth),
 creating a large burden on webhook maintainers to support verification of
-client identity by all three methods. More broadly, the burden is greatest
+client identity by all three methods. The burden is greatest
 when the actor setting up the API Server (or aggregated API server) and the
 actor setting up the webhook are not the same, as is usually the case with
 "off-the-shelf", community OSS webhooks.
 
-An opinionated, on-by-default solution is needed to reduce the friction
-to adoption. This KEP is designed to make it possible to transition in
-phases. First, [webhook authentication client](#webhook-authentication-client)
-libraries are configured to use them by default (except in cases where
-it would break an existing authentication setup). At this stage, webhooks
-may not yet have been updated to verify the tokens. Webhooks can instead
-silently ignore them. In the second phase, once credential issuance is GA and
-webhook maintainers can reasonably expect a credential to be present, webhook
-maintainers can use the provided library to opt-in to token verification. Over
-time, we expect this to make the landscape as a whole more secure.
+There are existing out-of tree solutions, such as
+[generic-admission-server](https://github.com/openshift/generic-admission-server).
+However, they require manual setup. This KEP posits that an
+ opinionated, on-by-default solution is needed to reduce the friction
+to adoption. It is designed to make it possible to transition in phases. First,
+[webhook authentication client](#webhook-authentication-client) libraries are
+configured to use them by default (except in cases where it would break an
+existing authentication setup). At this stage, webhooks may not yet have been
+updated to verify the tokens. Webhooks can instead silently ignore them. In
+the second phase, once credential issuance is GA and webhook maintainers can
+reasonably expect a credential to be present, webhook maintainers can use
+the provided library to opt-in to token verification. Over time, we expect
+this to make the landscape as a whole more secure.
 
 In addition to `kube-apiserver`, aggregated API servers often need to contact
 webhooks. Yet, they should should not have broad access to ask arbitrary
@@ -148,19 +151,23 @@ a malicious aggregated API server from requesting policy information about
 resources it does not control.
 
 The scope of this KEP is limited to authenticating to admission webhooks.
-Authentication webhooks, authorization webhooks, and audit webhooks do
-not share the same practical barriers to authentication experienced by
-admission webhooks. For one, those webhooks are not dynamically deployed at
-runtime, and they already require a `kube-apiserver` restart to change their
-configuration. Furthermore, because the actor setting up `kube-apiserver`
-and the actor setting up the webhook are the same in the vast majority of
-cases, it is much more reasonable to expect that such an actor would use
-the already available solution: they are in control of both the method of
-authentication used by the client and the verification methods used by the
-webhook. This leaves a slight gap, requiring that all deployed aggregated API
-servers that communicate with these webhooks must also have access to the
-necessary credentials. The gap is acknowledged but considered out-of-scope
-to keep the implementation practical for the most common use-cases.
+Authentication webhooks, authorization webhooks, and audit webhooks do not
+share the same practical barriers to authentication experienced by admission
+webhooks. Those webhooks are not dynamically deployed at runtime, and don't
+have the same logistical barriers as admission webhooks: the actor setting
+up `kube-apiserver` and the actor setting up the webhook are the same in the
+vast majority of cases. Therefore, it is much more reasonable to expect that
+such an actor would use the already available solution: they are in control
+of both the method of authentication used by the client and the verification
+methods used by the webhook. This leaves a slight gap, requiring that all
+deployed aggregated API servers that communicate with these webhooks must
+also have access to the necessary credentials. The gap is acknowledged but
+considered out-of-scope to keep the implementation practical for the most
+common use-cases.  TokenReview and SubjectAccessReview make this a non-issue
+for everything but audit webhooks.
+
+Conversion webhooks are likewise out of scope because they pertain to CRDs,
+
 
 ### Goals
 
@@ -204,7 +211,7 @@ the **Token Acquisition Service Account**. This is distinct from the identity
 that the principal requesting the token uses to authenticate itself to the
 Kubernetes API Server (which may or may not be a service account). The Token
 Acquisition Service Account must have `attest` permissions on the `APIService`
-object named in the `TokenRequest` ().
+object named in the `TokenRequest`.
 
 ### Webhook Authentication Client
 Because both `kube-apiserver` and aggregated API servers will attempt
@@ -274,9 +281,9 @@ Webhook libraries will be updated to optionally (and eventually always) require 
 
 1. Verify the token's signature via the OIDC discovery endpoint.
 1. Verify that the token's audience matches the expected audience. This audience
-   is derived deterministically from the webhook url, and is in the format
-   `https://<url>/with/path`, where `<url>` matches the one specified in
-   the webhook's configuration.
+   is derived deterministically from the webhook configuration. Several
+   alternatives have been discussed including the url, but the tradeoffs
+   are still being evaluated.
 1. Verify that the JWT is bound to one (and only
    one) of the [webhook authentication bound object
    types](#webhook-authentication-bound-object-types), and
@@ -359,7 +366,7 @@ sequenceDiagram
 In this example, a compromised aggregated API server attempts to probe a
 validating webhook, "splinter-validate", for policy information. It wants
 to spam the webhook with `AdmissionReview` requests in an attempt to find
-principals that can read `Secret`s. To do so, it requests a JWT bound to the
+principals that can write `Secret`s. To do so, it requests a JWT bound to the
 "splinter-validate" `ValidatingWebhookConfiguration`.
 
 ```mermaid
@@ -473,6 +480,12 @@ sequenceDiagram
 
 ### Risks and Mitigations
 
+#### Broad access to webhooks
+This is, unfortunately, the reality of most admission webhooks deployed today.
+This KEP addresses this by requiring explicit permission on a service account
+to create tokens for use in authenticating to webhooks. Therefore, only
+specially authorized service accounts may create webhook authentication tokens.
+
 #### Token replay across webhooks
 
 A JWT obtained for one webhook could be presented to another webhook if they
@@ -491,9 +504,9 @@ must match.
 
 If a service account is compromised, an attacker could request tokens and
 impersonate an aggregated API server to webhooks. The dedicated-SA-per-server
-model limits the impact of such a compromise. The `attest` check, properly
-applied to only the resources controlled by the aggregated API server,
-prevents the service account from even obtaining a token for other uses.
+model limits the impact of such a compromise. The `attest` permission,
+properly applied to only the resources controlled by the aggregated API
+server, prevents the service account from even obtaining a token for other uses.
 
 #### Increased authorization load
 
@@ -587,6 +600,9 @@ as the `BoundObjectRef`, it performs the following checks:
         service account](#token-acuisition-service-account) have `attest`
         permissions on the wildcard (`"*"`) `APIService`?
 
+To prevent cluster state from leaking, error messages should not expose any information
+about the existence or nonexistence of objects in the cluster.
+
 The `SubjectAccessReview` (SAR) checks are performed via an
 `authorizer.Authorize()` call against the token acquisition service account's
 identity.
@@ -603,7 +619,7 @@ metadata:
 rules:
   - apiGroups: [""]
     resources: ["serviceaccount/token"]
-    resourceName: webhook-token-acquisition-service-account
+    resourceNames: ["webhook-token-acquisition-service-account"]
     verbs: ["create"]
 
 ---
@@ -669,9 +685,10 @@ about. This was introduced to this KEP after it was pointed out that caching
 tokens per webhook+APIService combination. The number of tokens in that case
 would be a burden for `kube-apiserver` in particular.
 
-As such, the KEP authors recommend that **only `kube-apiserver`** should be
-granted `"attest"` on `"*"`. Aggregated API servers should instead be granted
-`"attest"` on those `APIService`s over which they have control.
+As such, the KEP authors recommend that **only `kube-apiserver`'s service
+account** should be granted `"attest"` on `"*"`. Aggregated API servers
+should instead be granted `"attest"` on those `APIService`s over which they
+have control.
 
 ### Audience
 
@@ -756,12 +773,11 @@ The webhook may verify these tokens by taking the following steps:
 When the bound object is an `APIService`, serviceaccount tokens for
 authentication to webhooks are cached per combination of webhook and
 `APIService`. When the bound object is a `ValidatingWebhookConfiguration` or
-`MutatingWebhookConfiguration`, the token will be cached per-webhook. When
-a cached token has expired, the next webhook call for that combination
-triggers a new `TokenRequest`. Tokens will expire after 10 minutes,
-or some shorter duration specified by the user via the `TokenRequest`'s
-`expirationSeconds`. A request containing `expirationSeconds` longer than
-ten minutes will be silently shortened to the maximum of ten minutes.
+`MutatingWebhookConfiguration`, the token will be cached per-webhook. When a
+cached token has expired, the next webhook call for that combination triggers
+a new `TokenRequest`. Tokens will expire after 10 minutes. Anything less is
+considered a validation error, and anything more will be silently shortened
+to 10 minues.
 
 ### Test Plan
 
