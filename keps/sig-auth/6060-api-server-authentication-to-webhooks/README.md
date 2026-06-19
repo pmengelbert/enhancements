@@ -103,14 +103,14 @@ admission webhook. Second, `kube-apiserver` will be updated to dispense
 those tokens to authenticated and authorized principals. Third, a token
 verification library will be introduced for use by webhook maintainers.
 
-This KEP augments the private claims of a service account token (JWT) to support
-three new types of bound object, which will be included in the `TokenRequest`
-made by the [webhook authentication client](#webhook-authentication-client). The
-bound object may be one of `APIService`, `ValidatingWebhookConfiguration`,
-or `MutatingWebhookConfiguration`.
+This KEP augments the `TokenRequest` API to allow for the client to
+request claims in the JWT token to which `kube-apiserver` attests. In
+addition, tokens may be bound to an admission webhook (either validating
+or mutating). The specifics of these changes are discussed in detail in the
+[design details](#design-details) section.
 
-A list of [terms](#terms) is provided below to prevent awkward sentence
-constructions and for disambiguation.
+A list of [terms](#terms) is provided below for disambiguation, and to
+prevent awkward sentence constructions.
 
 ## Motivation
 
@@ -148,8 +148,8 @@ In addition to `kube-apiserver`, aggregated API servers often need to contact
 webhooks. Yet, they should should not have broad access to ask arbitrary
 questions to webhooks. A design is needed to make it easy for aggregated API
 servers to query webhooks about resources it controls, but which prevents
-a malicious aggregated API server from requesting policy information about
-resources it does not control.
+a malicious or compromised aggregated API server from requesting policy
+information about resources it does not control.
 
 The scope of this KEP is limited to authenticating to admission webhooks.
 Authentication webhooks, authorization webhooks, and audit webhooks do not
@@ -168,7 +168,8 @@ common use-cases.  TokenReview and SubjectAccessReview make this a non-issue
 for everything but audit webhooks.
 
 Conversion webhooks are likewise out of scope because they pertain to CRDs,
-
+which will be handled exclusively by `kube-apiserver` and do not share the
+same set of complications caused by allowing access from aggregated API servers.
 
 ### Goals
 
@@ -193,6 +194,11 @@ Conversion webhooks are likewise out of scope because they pertain to CRDs,
 * The design is backward compatible: existing kubeconfig-based webhook
   authentication setups continue to work without modification.
 * Defining the webhook-side verification go library.
+* Tokens must be reviewable by `TokenReview`, although the webhook
+  library **WILL NOT** use `TokenReview` by default to avoid unnecessary
+  round trips.
+* The token claims must be reviewable by `SubjectAccessReview`, but the
+  webhook library will not use `SubjectAccessReview` by default.
 
 ### Non-Goals
 
@@ -206,13 +212,20 @@ Conversion webhooks are likewise out of scope because they pertain to CRDs,
 
 ## Terms
 
+### Token
+Unless otherwise indicted, the term **token** will be used to exclusively
+refer to service account tokens with two qualities: a webhook binding and
+a claim indicating which `APIGroup`s the token's bearer may inquire about.
+When discussing any other token, or service account tokens without both of these
+two qualities, they will be clearly distinguished by the surrounding context.
+
 ### Token Acquisition Service Account
 The service account named in tokens for webhook authentication will be termed
 the **Token Acquisition Service Account**. This is distinct from the identity
 that the principal requesting the token uses to authenticate itself to the
 Kubernetes API Server (which may or may not be a service account). The Token
-Acquisition Service Account must have `attest` permissions on the `APIService`
-object named in the `TokenRequest`.
+Acquisition Service Account must have `attest` permissions on the `APIGroup`
+named in the `TokenRequest`.
 
 ### Webhook Authentication Client
 Because both `kube-apiserver` and aggregated API servers will attempt
@@ -228,33 +241,40 @@ terms **`kube-apiserver`** and **Kubernetes API Server** will be used
 interchangeably. When referring specifically to an **Aggregated API Server**,
 the full term will always be used.
 
-### Webhook Authentication Bound Object Types
-The term **webhook authentication bound object types** will be used to refer
-to the three newly-added types considered valid as a `BoundObjectRef` in a
-`TokenRequest` where distinguishing between them is not important. Specifically,
-the new types recognized will be `APIService`, `ValidatingWebhookConfiguration`,
-and `MutatingWebhookConfiguration`.
-
 ## Proposal
 
-[Webhook authentication clients](#webhook-authentication-client) may
-request service account tokens with a narrow scope, indicating to the
-webhook that it is only valid for its audience and for `AdmissionReview`
-requests about resources with a particular combination of `APIGroup` and
-`APIVersion` (i.e. an `APIService`). Because the number of per-webhook,
-per-`APIService` tokens can quickly get out of hand for `kube-apiserver`,
-tokens may alternatively be requested that are valid per-webhook, but which
-have no indication of which `APIService` the token may be used for. Because
-the authorization scope of such tokens is larger, broader permissions
-are required to obtain them. Per-webhook tokens are intended for use by
-`kube-apiserver`, whereas per-webhook per-`APIService` tokens are intended
-for use by aggregated API Servers.
+[Webhook authentication clients](#webhook-authentication-client) may request
+service account tokens with a narrow scope, indicating to the webhook that it is
+only valid for its audience and for `AdmissionReview` requests about resources
+with a particular `APIGroup` (or, possibly, a set of `APIGroup`s). Because
+the number of per-webhook, per-`APIGroup` tokens can quickly get out of hand
+for `kube-apiserver`, tokens may alternatively be requested that are valid
+per-webhook, but which have no indication of which `APIService`(s) the token
+may be used for. Because the authorization scope of such tokens is larger,
+broader permissions are required to obtain them. Tokens without claims on
+`APIService`(s) are intended for use only with `kube-apiserver`, although
+there is no enforcement of this recommendation. On the other hand, tokens
+restricted by `APIGroup` are intended for use by aggregated API Servers
+to prevent giving them more access than is needed. A fuller description
+of the permission model for token acquisition is described in the design
+details section.
 
 The scoping of service account tokens to a particular usage is accomplished
-by adding three new types of private claim to the JWT body. Corresponding
-to each of these is a new type of valid `BoundObjectRef` in the body of a
-`TokenRequest`. This KEP makes `APIService`, `ValidatingWebhookConfiguration`,
-and `MutatingWebhookConfiguration` valid types for the `BoundObjectRef`.
+by means of a `TokenRequest` on a service account. For a client to obtain a
+[token](#token), it must meet four conditions. First, it must request claims
+indicating which `APIGroups` it intends to query the webhook about. This
+requires expanding the `TokenRequest` API, the details of which are described
+in the [design details](#design-details) section. TODO: link to the actual
+description. Second, it must specify either a `ValidatingWebhookConfiguration`
+or a `MutatingWebhookConfiguration` as the `BoundObjectRef`. Third, it must
+specify an audience that is valid for that `*WebhookConfiguration`. The
+exact specification of the derivation of the audience is deferred until
+implementation time, and is at the moment subject to change. Fourth and finally,
+the `ServiceAccount` for which the `TokenRequest` is being made must have
+sufficient permission to obtain the token. This is accomplished by means of
+a synthetic authorization check at token issuance, and is described in
+greater detail in the [design details](#design-details) section. TODO:
+link to the actual section describing authz checks.
 
 When a per-token webhook is required, as will be the case when the webhook
 authentication client is `kube-apiserver`, the bound object will typically be a
