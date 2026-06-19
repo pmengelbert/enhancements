@@ -259,62 +259,62 @@ to prevent giving them more access than is needed. A fuller description
 of the permission model for token acquisition is described in the design
 details section.
 
-The scoping of service account tokens to a particular usage is accomplished
-by means of a `TokenRequest` on a service account. For a client to obtain a
-[token](#token), it must meet four conditions. First, it must request claims
-indicating which `APIGroups` it intends to query the webhook about. This
-requires expanding the `TokenRequest` API, the details of which are described
-in the [design details](#design-details) section. TODO: link to the actual
-description. Second, it must specify either a `ValidatingWebhookConfiguration`
-or a `MutatingWebhookConfiguration` as the `BoundObjectRef`. Third, it must
-specify an audience that is valid for that `*WebhookConfiguration`. The
-exact specification of the derivation of the audience is deferred until
-implementation time, and is at the moment subject to change. Fourth and finally,
-the `ServiceAccount` for which the `TokenRequest` is being made must have
-sufficient permission to obtain the token. This is accomplished by means of
-a synthetic authorization check at token issuance, and is described in
-greater detail in the [design details](#design-details) section. TODO:
-link to the actual section describing authz checks.
+The `TokenRequest` API will be expanded to accomodate the scoping of
+service account tokens to a particular usage. A brief description of
+those expansions is in order. To obtain a [token](#token), the webhook
+authentication client will make a `TokenRequest` on a service account. For
+a client to obtain a token, it must meet four conditions. First, it must
+request claims indicating which `APIGroups` it intends to query the webhook
+about. Further details are described in the [design details](#design-details)
+section. TODO: link to the actual description. Second, it must specify either a
+`ValidatingWebhookConfiguration` or a `MutatingWebhookConfiguration` as the
+`BoundObjectRef`. Third, it must specify an audience that is coherent for
+that `*WebhookConfiguration`. The exact specification of the derivation of the
+audience is deferred until implementation time, and is at the moment subject to
+change. Fourth and finally, the `ServiceAccount` for which the `TokenRequest`
+is being made must have sufficient permission to obtain the token. This is
+accomplished by means of a synthetic authorization check at token issuance,
+and is described in greater detail in the [design details](#design-details)
+section. TODO: link to the actual section describing authz checks.
 
-When a per-token webhook is required, as will be the case when the webhook
-authentication client is `kube-apiserver`, the bound object will typically be a
-`ValidatingWebhookConfiguration` or a `MutatingWebhookConfiguration`. Selection
-between the two is of course dependent on which type of webhook `kube-apiserver`
-wishes to contact. The token with one of these two bound object types
-authorizes its bearer to ask *any question* of a single webhook.
+When the `TokenRequest` caller wants a token authorizing the bearer to inquire
+about resources in any `APIGroup`, it will request that `kube-apiserver` attest
+to a claim on the `"*" APIGroup`. This requires that the token acquisition
+service account have broader permissions, described further in the [design
+details](#design-details) section. TODO: link to the authz section in design
+details.
 
-Aggregated API servers should not have such broad access to ask questions
-of webhooks. One programmed to maliciously request policy information about
-resources it does not control should be prevented from doing so.
-
-When the webhook authentication client is an aggregated API server, the
-bound object should be an `APIService`. This indicates to the webhook that
-it should deny `AdmissionReview` requests that pertain to objects within that
-`APIService`'s `APIGroup` and `APIVersion`. This is recommended to prevent a
+This broad permission should only be granted to `kube-apiserver`, and its use by
+principals representing aggregated API servers is strongly discouraged. Instead,
+aggregated API servers should request that `kube-apiserver` attest to the
+`APIGroup` corresponding to the server's `APIService`(s) (there may be multiple
+`APIServices` to express multiple `APIVersion`s of a single `APIGroup`). This
+indicates to the webhook that it should deny `AdmissionReview` requests that
+pertain to objects within that `APIGroup`. This is recommended to prevent a
 potentially malicious aggregated API server from exposing a webhook's policy
 information or compromising it in some other way.
 
-The `TokenRequest` handler will be updated to accommodate the three new
+The `TokenRequest` handler will be updated to accommodate the new
 kinds of bound object. When one of them is used, it will trigger additional
-authorization checks (described in another section below).
+authorization checks (described in another section below), and checks on the
+existence of the bound objects. Likewise, it will be augmented to perform
+authorization checks on the permissions of the service account for which
+the token is requested.
 
 Webhook libraries will be updated to optionally (and eventually always) require a bearer token. The webhook then verifies these tokens by taking the following steps:
 
-1. Verify the token's signature via the OIDC discovery endpoint.
-1. Verify that the token's audience matches the expected audience. This audience
+1. Verify the token's signature via the OIDC discovery endpoint.  1. Verify
+   that the token's audience matches the expected audience. This audience
    is derived deterministically from the webhook configuration. Several
    alternatives have been discussed including the url, but the tradeoffs
    are still being evaluated.
 1. Verify that the JWT is bound to one (and only
    one) of the [webhook authentication bound object
    types](#webhook-authentication-bound-object-types), and
-     a. When the bound object is a `ValidatingWebhookConfiguration`, reject
-        the request if the webhook is not a validating admission webhook.
-     b. When the bound object is a `MutatingWebhookConfiguration`, reject
-        the request if the webhook is not a mutating admission webhook.
-     c. When the bound object is an `APIService`, reject the request if
-        the resource named in the `AdmissionReview` request body is not a member
-        of the `APIGroup` and `APIVersion` corresponding to that `APIService`.
+1. Verify that the resource named in the `AdmissionReview` request body is
+   a member of the `APIGroup`(s) named in the private claims. The `*`
+   `APIGroup` is a superset of all `APIGroup`s. When the `APIGroup` is `*`,
+   this check will always succeed.
 
 ### Sequence Diagrams
 
