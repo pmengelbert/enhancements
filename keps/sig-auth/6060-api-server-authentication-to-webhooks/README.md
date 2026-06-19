@@ -171,6 +171,10 @@ Conversion webhooks are likewise out of scope because they pertain to CRDs,
 which will be handled exclusively by `kube-apiserver` and do not share the
 same set of complications caused by allowing access from aggregated API servers.
 
+Credentials issued for authentication to webhook must be reviewable by
+`kube-apiserver`, but webhooks should be able to verify them independently. No
+API calls should be required of webhooks to verify tokens.
+
 ### Goals
 
 * `kube-apiserver` authenticates itself to admission webhooks by default,
@@ -247,17 +251,16 @@ the full term will always be used.
 service account tokens with a narrow scope, indicating to the webhook that it is
 only valid for its audience and for `AdmissionReview` requests about resources
 with a particular `APIGroup` (or, possibly, a set of `APIGroup`s). Because
-the number of per-webhook, per-`APIGroup` tokens can quickly get out of hand
-for `kube-apiserver`, tokens may alternatively be requested that are valid
-per-webhook, but which have no indication of which `APIService`(s) the token
-may be used for. Because the authorization scope of such tokens is larger,
+the number of per-webhook, per-`APIGroup` tokens can quickly get out of
+hand for `kube-apiserver`, tokens may alternatively be requested that are
+valid per-webhook, but which authorize the bearer to ask questions about
+**any resource**. Because the authorization scope of such tokens is larger,
 broader permissions are required to obtain them. Tokens without claims on
-`APIService`(s) are intended for use only with `kube-apiserver`, although
-there is no enforcement of this recommendation. On the other hand, tokens
-restricted by `APIGroup` are intended for use by aggregated API Servers
-to prevent giving them more access than is needed. A fuller description
-of the permission model for token acquisition is described in the design
-details section.
+`APIGroup`(s) are intended for use only with `kube-apiserver`, although there is
+no enforcement of this recommendation. On the other hand, tokens restricted by
+`APIGroup` are intended for use by aggregated API Servers to prevent giving
+them more access than is needed. A fuller description of the permission
+model for token acquisition is described in the design details section.
 
 The `TokenRequest` API will be expanded to accomodate the scoping of
 service account tokens to a particular usage. A brief description of
@@ -288,7 +291,7 @@ This broad permission should only be granted to `kube-apiserver`, and its use by
 principals representing aggregated API servers is strongly discouraged. Instead,
 aggregated API servers should request that `kube-apiserver` attest to the
 `APIGroup` corresponding to the server's `APIService`(s) (there may be multiple
-`APIServices` to express multiple `APIVersion`s of a single `APIGroup`). This
+`APIService`s to express multiple `APIVersion`s of a single `APIGroup`). This
 indicates to the webhook that it should deny `AdmissionReview` requests that
 pertain to objects within that `APIGroup`. This is recommended to prevent a
 potentially malicious aggregated API server from exposing a webhook's policy
@@ -303,14 +306,13 @@ the token is requested.
 
 Webhook libraries will be updated to optionally (and eventually always) require a bearer token. The webhook then verifies these tokens by taking the following steps:
 
-1. Verify the token's signature via the OIDC discovery endpoint.  1. Verify
-   that the token's audience matches the expected audience. This audience
+1. Verify the token's signature via the OIDC discovery endpoint.
+1. Verify that the token's audience matches the expected audience. This audience
    is derived deterministically from the webhook configuration. Several
    alternatives have been discussed including the url, but the tradeoffs
    are still being evaluated.
-1. Verify that the JWT is bound to one (and only
-   one) of the [webhook authentication bound object
-   types](#webhook-authentication-bound-object-types), and
+1. Verify that the JWT is bound to one (and only one) of
+   `ValidatingWebhookConfiguration` or `MutatingWebhookConfiguration`.
 1. Verify that the resource named in the `AdmissionReview` request body is
    a member of the `APIGroup`(s) named in the private claims. The `*`
    `APIGroup` is a superset of all `APIGroup`s. When the `APIGroup` is `*`,
@@ -328,12 +330,13 @@ token verification.
 In this example, a user attempts to create a deployment named "ninja-turtles"
 (user request omitted from diagram). This requires review by the mutating
 admission webhook "mutagen-capsule". In order to authenticate itself to the
-webhook, `kube-apiserer` makes a `TokenRequest` for its dedicated service
+webhook, `kube-apisever` makes a `TokenRequest` for its dedicated service
 account `kube-system:webhook-auth`, bound to the `MutatingWebhookConfiguration`
-for the "mutagen-capsule" webhook. It binds the token to the webhook, rather
-than the `"v1.apps" APIService`, to avoid the burden of maintaining too
-many tokens. The `kube-system:webhook-auth` service account has `"attest"`
-permissions on the synthetic `"*"` `APIService`.
+for the "mutagen-capsule" webhook. It requests the `"*" APIGroup`, rather than
+the `"apps" APIGroup`, to avoid the burden of maintaining too many tokens, and
+because `kube-apiserver` is a privileged actor. The `kube-system:webhook-auth`
+service account has `"attest"` permissions on the synthetic `APIGroup`
+resource with the `"*"` name.
 
 ```mermaid
 sequenceDiagram
@@ -343,17 +346,17 @@ sequenceDiagram
 
     KAS->>KAS: Check token cache
     alt Cache miss or token expired
-        KAS->>TokenReq: TokenRequest for "kube-system:webhook-auth"<br/>BoundObjectRef: MutatingWebhookConfiguration "mutagen-capsule"<br/>Audience: "https://mutagen-capsule.default.svc/admission/review"
+        KAS->>TokenReq: TokenRequest for "kube-system:webhook-auth"<br/>BoundObjectRef: MutatingWebhookConfiguration "mutagen-capsule"<br/>Audience: "https://mutagen-capsule.default.svc/admission/review"<br/>AttestationClaims: { "allowedAPIGroups": ["*"] }
 
         TokenReq->>TokenReq: Authenticate client
         Note over TokenReq: Authorization
 
         TokenReq->>TokenReq: Can TokenRequest client  principal (`kube-system` as client)<br/>"create" serviceaccounts/token for kube-system:webhook-auth?
         TokenReq->>TokenReq: Does MutatingWebhookConfiguration<br/>"mutagen-capsule" exist?
-        TokenReq->>TokenReq: Does kube-system:webhook-auth have<br/>"attest" on APIService "*"?
+        TokenReq->>TokenReq: Does kube-system:webhook-auth have<br/>"attest" on APIGroup "*"?
 
         TokenReq-->>KAS: Token issued (see payload below)
-        Note over KAS: Cache JWT
+        KAS->>KAS: Cache JWT
     end
 
     Note over KAS,Webhook: AdmissionReview
@@ -362,7 +365,7 @@ sequenceDiagram
     Note over Webhook: Verify JWT
     Webhook->>Webhook: Check signature<br/>(OIDC discovery)<br/>
     Webhook->>Webhook: Check audience
-    Webhook->>Webhook: Check bound objects<br/>Am I a mutating admission webhook?
+    Webhook->>Webhook: Check private claims<br/>Authorized for `"apps" APIGroup`?
 
     Webhook-->>KAS: AdmissionReview response
 ```
@@ -377,7 +380,8 @@ sequenceDiagram
       "mutatingWebhookConfiguration": {
           "name": "mutagen-capsule",
           "uid": "<uid>"
-      }
+      },
+      "allowedAPIGroups": ["*"]
   }
 }
 ```
@@ -387,8 +391,9 @@ sequenceDiagram
 In this example, a compromised aggregated API server attempts to probe a
 validating webhook, "splinter-validate", for policy information. It wants
 to spam the webhook with `AdmissionReview` requests in an attempt to find
-principals that can write `Secret`s. To do so, it requests a JWT bound to the
-"splinter-validate" `ValidatingWebhookConfiguration`.
+principals that can write `Secret`s. To do so, it requests a JWT bound to
+the "splinter-validate" `ValidatingWebhookConfiguration`, requesting that
+`kube-apiserver` attest to the claim `{"allowedAPIGroups": ["*"]}`.
 
 ```mermaid
 sequenceDiagram
@@ -404,13 +409,13 @@ sequenceDiagram
     AAS->>AAS: Check JWT cache
     alt Cache miss
         Note over KAS,AAS: Token Acquisition
-        AAS->>KAS: TokenRequest for "turtles-webhook-auth"<br/>BoundObjectRef: ValidatingWebhookConfiguration "splinter-validate"<br/>Audience: https://splinter-validate.default.svc/admission/review
+        AAS->>KAS: TokenRequest for "turtles-webhook-auth"<br/>BoundObjectRef: ValidatingWebhookConfiguration "splinter-validate"<br/>Audience: https://splinter-validate.default.svc/admission/review<br/>AttestationClaims: { "allowedAPIGroups": ["*"] }
 
         KAS->>KAS: Authenticate client
         Note over KAS: Authorization
         KAS->>KAS: Can AAS principal "create"<br/>serviceaccounts/token for turtles-webhook-auth?
         KAS->>KAS: Does MutatingWebhookConfiguration<br/>"mutagen-capsule" exist?
-        KAS->>KAS: Does kube-system:webhook-auth have<br/>"attest" on APIService "*"?
+        KAS->>KAS: Does turtles-webhook-auth<br/>have "attest" on APIGroup "*"?
 
         KAS-->>AAS: 403 Forbidden
     end
@@ -426,11 +431,12 @@ sequenceDiagram
 
 In this example, an untrusted aggregated API server attempts to make an
 `AdmissionReview` request to the validating webhook, "splinter-validate". It
-makes two requests about two different resources; it makes these requests with
-the same token, which is bound to the `APIService` `"v1.ninja.turtles.ai"`.
-In the first request, which is denied, it makes an `AdmissionReview` request
-about `"v1."` `Secret`s. In the second request, which is successful, it is
-asking about `"v1.ninja.turtles.ai"` `NinjaTurtle`s.
+makes two requests about two different resources; it makes these requests
+with the same token, which is bound to the `ValidatingWebhookConfiguration`
+for that webhook.  In the first request, which is denied, it makes an
+`AdmissionReview` request about `Secret`s in the `"" APIGroup` (i.e. no
+API group). In the second request, which is successful, it is asking about
+`NinjaTurtle`s in the `"ninja.turtles.ai" APIGroup`.
 
 ```mermaid
 sequenceDiagram
@@ -446,12 +452,12 @@ sequenceDiagram
     AAS->>AAS: Check JWT cache
     alt Cache miss
         Note over KAS,AAS: Token Acquisition
-        AAS->>KAS: TokenRequest<br/>SA:"turtles-webhook-auth"<br/>BoundObjectRef: APIService "v1.ninja.turtles.ai"<br/>Audience:"https://splinter-validate.default.svc/admission/review"
+        AAS->>KAS: TokenRequest<br/>SA:"turtles-webhook-auth"<br/>BoundObjectRef: ValidatinWebhookConfiguration "splinter-validate"<br/>Audience:"https://splinter-validate.default.svc/admission/review"<br/>AttestationClaims: { "allowedAPIGroups": ["ninja.turtles.ai"] }
 
         Note over KAS: Authorization
         KAS->>KAS: Can AAS principal "create"<br/>tokens for turtles-webhook-auth?
-        KAS->>KAS: APIService<br/>"v1.ninja.turtles.ai" exists?
-        KAS->>KAS: Does webhook-auth have<br/>"attest" on APIService "v1.ninja.turtles.ai"?
+        KAS->>KAS: Is there a registered APIService with <br/>APIGroup "ninja.turtles.ai"?
+        KAS->>KAS: Does turtles-webhook-auth have<br/>"attest" on APIGroup "ninja.turtles.ai"?
 
         KAS-->>AAS: Issue JWT
         AAS->>AAS: Cache JWT
@@ -459,23 +465,23 @@ sequenceDiagram
 
     Note over AAS,Webhook: AdmissionReview
     alt Disallowed AdmissionReview resource
-        AAS->>Webhook: AdmissionReview<br/>Authorization: Bearer <JWT><br/>AdmissionReview: can "ben" read "v1." Secrets?
+        AAS->>Webhook: AdmissionReview<br/>Authorization: Bearer <JWT><br/>AdmissionReview: can "ben" read Secrets (APIGroup "")?
 
         Note over Webhook: Verify JWT
         Webhook->>Webhook: Signature (OIDC discovery)? - OK
         Webhook->>Webhook: Audience? - OK
-        Webhook-->>Webhook: APIService/AdmissionReview coherence?<br/>"v1.ninja.turtles.ai" ≠ "v1." - NO
+        Webhook-->>Webhook: APIGroup/AdmissionReview coherence?<br/>"ninja.turtles.ai" ≠ "" - NO
 
         Webhook-->>AAS: 403 Forbidden
     end
 
     alt Successful flow
-        AAS->>Webhook: AdmissionReview<br/>Authorization: Bearer <JWT><br/>AdmissionReview: can "ben" create "v1.ninja.turtles.ai" NinjaTurtles?
+        AAS->>Webhook: AdmissionReview<br/>Authorization: Bearer <JWT><br/>AdmissionReview: can "ben" create NinjaTurtles (APIGroup "ninja.turtles.ai")?
 
         Note over Webhook: Verify Token
         Webhook->>Webhook: Check signature<br/>(OIDC discovery)
         Webhook->>Webhook: Check audience
-        Webhook->>Webhook: Check apiService claim<br/>is AdmissionReview about<br/>v1.ninja.turtles.ai?
+        Webhook->>Webhook: Check allowedAPIGroups claim<br/>is AdmissionReview about ninja.turtles.ai?
 
         Webhook-->>AAS: 200 OK
     end
@@ -490,10 +496,11 @@ sequenceDiagram
   "aud": "https://splinter-validate.default.svc/admission/review",
   <...>
   "kubernetes.io": {
-      "apiService": {
-          "name": "v1.ninja.turtles.ai",
+      "validatingWebhookConfiguration": {
+          "name": "splinter-validate",
           "uid": "<uid>"
-      }
+      },.
+      "allowedAPIGroups": ["ninja.turtles.ai"]
   }
 }
 ```
@@ -547,7 +554,7 @@ for its [token acquisition service account](#token-acquisition-service-account)
 to the Kubernetes API Server. The request includes:
 
 1. A `BoundObjectRef` pointing to either
-   a. the `APIService` corresponding to the resource being admitted (e.g. `v1.networking.k8s.io`), or
+   a. the `APIService` corresponding to the resource being admitted (e.g. `networking.k8s.io`), or
    b. a `ValidatingWebhookConfiguration` or `MutatingWebhookConfiguration` object.
 1. The name of a [token acquisition service
    account](#token-acquisition-service-account) with `attest` permission on
@@ -665,9 +672,9 @@ kind: ClusterRole
 metadata:
   name: let-the-webhook-token-acquisition-service-account-request-tokens-bound-to-an-api-service
 rules:
-  - apiGroups: ["apiregistration.k8s.io"]
-    resources: ["apiservices"]
-    resourceName: "v1.example.com"
+  - apiGroups: ["webhook-authentication.k8s.io"]
+    resources: ["apigroups"]
+    resourceName: "jungle.panda"
     verbs: ["attest"]
 
 ---
@@ -726,27 +733,11 @@ fields in the `kubernetes.io` private claims of the JWT:
 ```json
 {
   "kubernetes.io": {
-    "apiService": {
-      "name": "v1.example.com",
-      "uid": "44e818f2-2ad0-4432-9816-3a649ca9945c"
-    }
-  }
-}
-```
-
-The `name` field encodes the API version and group in the standard
-`<version>.<group>` format. The `uid` field is the UID of the APIService
-object at the time the token was issued.
-
-or
-
-```json
-{
-  "kubernetes.io": {
     "mutatingWebhookConfiguration": {
       "name": "mutagen-capsule",
       "uid": "44e818f2-2ad0-4432-9816-3a649ca9945c"
-    }
+    },
+    "allowedAPIGroups": ["jungle.panda"]
   }
 }
 ```
@@ -758,10 +749,12 @@ or
   "kubernetes.io": {
     "validatingWebhookConfiguration": {
       "name": "splinter-validate",
-      "uid": "44e818f2-2ad0-4432-9816-3a649ca9945c"
-    }
+      "uid": "b0f1b456-6f90-4546-b72c-d9000e5dead1"
+    },
+    "allowedAPIGroups": ["jungle.panda"]
   }
 }
+```
 ```
 
 Where the `mutatingWebhookConfiguration` or `validatingWebhookConfiguration`
