@@ -523,10 +523,9 @@ was minted.
 
 #### Token replay across API groups
 
-A token bound to one APIService could be presented when admitting a resource
-from a different API group. The webhook's verification of the APIService
-claims against the AdmissionReview body prevents this: the group and version
-must match.
+A token with claims to one APIGroup could be presented when admitting a resource
+from a different API group. The webhook's verification of the APIGroup claims
+against the AdmissionReview body prevents this: the groups must match.
 
 #### Service account compromise
 
@@ -538,9 +537,19 @@ server, prevents the service account from even obtaining a token for other uses.
 
 #### Increased authorization load
 
-Each  request triggers an additional authorization check (the `attest`
+Each request triggers an additional authorization check (the `attest`
 verification). This is mitigated by caching: tokens are cached for their
 lifetime, so the authorization check is amortized over many webhook calls.
+
+#### Potential Deadlock
+
+If an admission webhook is configured to intercept `TokenReview` requests,
+**and** the webhook requires an authentication token, there will be a deadlock
+with no way to proceed. This will be mitigated by designing authentication in
+such a way that the webhook authentication client attempts to proceed without
+a token. Other mitigations have been discussed, and it is an open question
+which mitigation is the best alternative. The discussion will continue at
+implementation time and will be subject to code review.
 
 ## Design Details
 
