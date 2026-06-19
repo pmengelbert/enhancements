@@ -452,7 +452,7 @@ sequenceDiagram
     AAS->>AAS: Check JWT cache
     alt Cache miss
         Note over KAS,AAS: Token Acquisition
-        AAS->>KAS: TokenRequest<br/>SA:"turtles-webhook-auth"<br/>BoundObjectRef: ValidatinWebhookConfiguration "splinter-validate"<br/>Audience:"https://splinter-validate.default.svc/admission/review"<br/>AttestationClaims: { "allowedAPIGroups": ["ninja.turtles.ai"] }
+        AAS->>KAS: TokenRequest<br/>SA:"turtles-webhook-auth"<br/>BoundObjectRef: ValidatingWebhookConfiguration "splinter-validate"<br/>Audience:"https://splinter-validate.default.svc/admission/review"<br/>AttestationClaims: { "allowedAPIGroups": ["ninja.turtles.ai"] }
 
         Note over KAS: Authorization
         KAS->>KAS: Can AAS principal "create"<br/>tokens for turtles-webhook-auth?
@@ -553,6 +553,87 @@ implementation time and will be subject to code review.
 
 ## Design Details
 
+### Changes to `TokenRequest` API
+
+#### Changes to `TokenRequestSpec`
+
+`TokenRequestSpec` will be augmented to allow for the specification of
+`AttestationClaims`, with a type of `map[string][]string`. This is modeled
+after the `UserInfo.Extra` field, which has served well for its purpose and
+proven flexible.
+
+The keys to this map represent  the names of claims to which the client wishes
+`kube-apiserver` to attest. The values reprsent the specifics of the claim. The
+keys will be well-known. Arbitrary keys may not be used. Keys not recognized
+by `kube-apiserver` will result in a rejection of the `TokenRequest`. The
+addition of keys recognized by `kube-apiserver` will be subject to API review.
+The meaning of the value or values will be well-defined.  The same value
+may change meaning when it corresponds to a different key, but the meaning
+within the purview of each key (claim name) must be well-defined.
+
+Claims will be namespaced by a prefixed domain. That is, they will be of
+the form: `<FQDN>/<name>`.
+
+```go
+// TokenRequestSpec contains client provided parameters of a token request.
+type TokenRequestSpec struct {
+    // NOTE: Newly added: AttestationClaims (described above)
+    AttestationClaims map[string][]string
+
+	// Audiences are the intended audiences of the token. A recipient of a
+	// token must identify themself with an identifier in the list of
+	// audiences of the token, and otherwise should reject the token. A
+	// token issued for multiple audiences may be used to authenticate
+	// against any of the audiences listed but implies a high degree of
+	// trust between the target audiences.
+	Audiences []string
+
+	// ExpirationSeconds is the requested duration of validity of the request. The
+	// token issuer may return a token with a different validity duration so a
+	// client needs to check the 'expiration' field in a response.
+	ExpirationSeconds int64
+
+	// BoundObjectRef is a reference to an object that the token will be bound to.
+	// The token will only be valid for as long as the bound object exists.
+	// NOTE: The API server's TokenReview endpoint will validate the
+	// BoundObjectRef, but other audiences may not. Keep ExpirationSeconds
+	// small if you want prompt revocation.
+	BoundObjectRef *BoundObjectReference
+}
+```
+
+#### Changes to `TokenRequest` handler
+
+In addition, the handler for `TokenRequest` will be updated to recognize
+`ValidatingWebhookConfiguration` and `MutatingWebhookConfiguration` as valid
+`BoundObjectRef`s. When one of these bindings is used, the `"allowedAPIGroups"
+AttestationClaim` **must** be provided. To fail to do so is considered an
+error and the request will be rejected.
+
+The handler will be updated to perform authorization checks to ensure the
+service account for which the `TokenRequest` is made has the requisite
+permissions. These checks are described in detail in another section below.
+
+#### Added claim: `"webhook-authentication.k8s.io/allowedAPIGroups"`
+
+The first valid key (claim name) for the `AttestationClaims` field will
+be a claim named `"webhook-authentication.k8s.io/allowedAPIGroups"`. It is
+intended that only one `APIGroup` be specified. In other words, the value
+must be a string slice of length 1; else, the request will be considered
+improperly formed.
+
+The special wildcard value `"*"` is recognized here to mean the token
+will be valid for **all `APIGroup`s**. Any other value represents a
+single `APIGroup` for which the resulting token will be valid. When not a
+wildcard, the `APIGroup` must correspond to at least one real `APIService`
+matched on the `APIService`'s `APIGroup` field (there may be multiple,
+owing to different versions of the same `APIGroip`, but only one is
+required). `"webhook-authentication.k8s.io/allowedAPIGroups"` values that
+match only to deleted or nonexistent `APIServices` will be rejected.
+
+Claims are subject to authorization checks on the service account for which
+the `TokenRequest` is made. These are described in detail in a later section.
+
 ### Token Acquisition (from the client perspective)
 
 #### All webhook authentication clients:
@@ -562,35 +643,36 @@ to call an admission webhook about a given resource, it issues a `TokenRequest`
 for its [token acquisition service account](#token-acquisition-service-account)
 to the Kubernetes API Server. The request includes:
 
-1. A `BoundObjectRef` pointing to either
-   a. the `APIService` corresponding to the resource being admitted (e.g. `networking.k8s.io`), or
-   b. a `ValidatingWebhookConfiguration` or `MutatingWebhookConfiguration` object.
+1. A `BoundObjectRef` pointing to either a `ValidatingWebhookConfiguration`
+   or `MutatingWebhookConfiguration` object.
 1. The name of a [token acquisition service
    account](#token-acquisition-service-account) with `attest` permission on
    the bound APIService.
 1. An audience derived from the webhook's url.
-
-The `BoundObjectRef` described in 1a are typical of an Aggregated API
-Server, whereas those in 1b are typical for `kube-apiserver`. The webhook
-authentication client will only receive the token if the authorization checks
-(described in a separate section below) succeed.
+1. An `AttestationClaim` with the key `"webhook-authentication.k8s.io/allowedAPIGroups"`,
+   and a value indicating which `APIGroup`s the resulting token should authorize
+   its bearer to ask webhooks about.
 
 #### `kube-apiserver`:
 In the case of `kube-apiserver`, the [token acquisition service
-account](#token-acqcuisition-service-account) will be a service with a
-well-known name, `kube-system:webhook-auth`, which is automatically created
-in the boostrapping process.
+account](#token-acqcuisition-service-account) will be a service account
+with a well-known name, `kube-system:webhook-auth`, which is automatically
+created in the boostrapping process, and automatically recreated on deletion.
 
 When `kube-apiserver` needs to call an admission webhook, it will be
 doing so for a resource (or custom resource) it serves directly. The
 `BoundObjectRef` in the `TokenRequest` must be the one corresponding to the
 `ValidatingWebhookConfiguration` or `MutatingWebhookConfiguration` of the
-webhook it seeks to consult. In effect, this is a request for a token is
-valid for **a specific webhook** but for **all `APIService`s**.
+webhook it seeks to consult. The audience must be coherent with the bound
+object.  Because this is `kube-apiserver`, this request is a request for a token
+is valid for **a specific webhook** but for **all `APIService`s**. As such,
+it should make the claim `"webhook-authentication.k8s.io/allowedAPIGroups":
+["*"]`.
 
 The requester will only receive the JWT token when the authorization checks
-(described below) succeed. When the principal is `kube-apiserver`, this will
-always succeed under normal working conditions.
+(described below) succeed. When the principal is `kube-apiserver`, this
+will always succeed unless the request happens to occur after the deletion
+of its service account but before it can be recreated.
 
 #### Aggregated API Servers:
 When an aggregated API server needs to call an admission webhook, it requests
