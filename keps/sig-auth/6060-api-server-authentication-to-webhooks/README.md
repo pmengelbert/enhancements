@@ -950,13 +950,11 @@ None identified at this time.
 
 ##### Unit tests
 
-- `k8s.io/apiserver/pkg/admission/plugin/webhook`: `<date>` - `<coverage>`
-- `k8s.io/apiserver/pkg/util/webhook`: `<date>` - `<coverage>`
-- `k8s.io/apiserver/pkg/registry/serviceaccount/token`: `<date>` - `<coverage>`
-
 Unit tests will cover:
-- TokenRequest with APIService BoundObjectRef issues correct private claims.
+- `TokenRequest` with `AttestationClaims` field issues correct private claims.
 - The `attest` authorization check is performed and enforced.
+- `TokenRequest` validation is performed with `BoundObjectRef`s pointing to
+  `ValidatingWebhookConfiguration` or `MutatingWebhookConfiguration`.
 - The webhook dispatch path attaches the token as a bearer token when the
   feature gate is enabled.
 - The webhook dispatch path does not attach a token when the feature gate
@@ -967,10 +965,11 @@ Unit tests will cover:
 - Token issuance and webhook dispatch end-to-end with a test webhook that
   verifies token claims.
 - Rejection when the SA lacks `attest` permission.
-- Rejection when the referenced APIService does not exist.
+- Rejection when the `APIService` for an `APIGroup` does not exist.
 - Cache behavior: verify that a cached token is reused and that a new token
   is requested on expiry.
 - Feature gate toggling: verify behavior with the gate on and off.
+- A webhook rejects a request where the bound object does not match the webhook type.
 
 ##### e2e tests
 
@@ -978,7 +977,6 @@ Unit tests will cover:
   JWT bound to each of the three new types.
 - A webhook rejects a request where the APIService claims do not match the
   resource in the AdmissionReview body.
-- A webhook rejects a request where the bound object does not match the webhook type.
 
 ### Graduation Criteria
 
