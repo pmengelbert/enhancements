@@ -42,6 +42,7 @@
   - [Audience](#audience)
   - [New JWT Private Claims](#new-jwt-private-claims)
   - [Token Verification](#token-verification)
+  - [Token Review](#token-review)
   - [Token Caching and Rotation](#token-caching-and-rotation)
   - [Test Plan](#test-plan)
       - [Prerequisite testing updates](#prerequisite-testing-updates)
@@ -388,7 +389,9 @@ sequenceDiagram
           "name": "mutagen-capsule",
           "uid": "<uid>"
       },
-      "allowedAPIGroup": ["*"]
+    attestationClaims: {
+        "webhook-authentication.k8s.io/allowedAPIGroup": ["*"]
+    }
   }
 }
 ```
@@ -506,8 +509,10 @@ sequenceDiagram
       "validatingWebhookConfiguration": {
           "name": "splinter-validate",
           "uid": "<uid>"
-      },.
-      "allowedAPIGroup": "ninja.turtles.ai"
+      },
+      attestationClaims: {
+          "webhook-authentication.k8s.io/allowedAPIGroup": ["ninja.turtles.ai"]
+      }
   }
 }
 ```
@@ -844,15 +849,21 @@ with name `"webhook-authentication.k8s.io/allowedAPIGroup"`.
 
 ### Audience
 
-The token's audience is the webhook's configured url.
+The token's audience is derived from the webhook configuration. Client and
+`kube-apiserver` will perform the same derivation, and will derive the same
+value. The exact format of the value has not yet been determined and various
+alternatives are being weighed.
 
 The webhook verifies that the token's `aud` claim matches its configured
 identity before accepting the request.
 
 ### New JWT Private Claims
 
-Tokens intended for authenticating to webhooks include the following new
-fields in the `kubernetes.io` private claims of the JWT:
+Tokens intended for authenticating to webhooks include the
+following new fields in the `kubernetes.io` private claims of the
+JWT. `"{mutating,validating}WebhookConfiguration"` are typical bound
+objects. The newly-added attestation claims described above are nested as a
+`map[string][]string` under `"attestationClaims"`:
 
 ```json
 {
@@ -861,7 +872,9 @@ fields in the `kubernetes.io` private claims of the JWT:
       "name": "mutagen-capsule",
       "uid": "44e818f2-2ad0-4432-9816-3a649ca9945c"
     },
-    "allowedAPIGroup": ["jungle.panda"]
+    attestationClaims: {
+        "webhook-authentication.k8s.io/allowedAPIGroup": ["jungle.panda"]
+    }
   }
 }
 ```
@@ -875,14 +888,15 @@ or
       "name": "splinter-validate",
       "uid": "b0f1b456-6f90-4546-b72c-d9000e5dead1"
     },
-    "allowedAPIGroup": "jungle.panda"
+    attestationClaims: {
+        "webhook-authentication.k8s.io/allowedAPIGroup": ["jungle.panda"]
+    }
   }
 }
 ```
-```
 
 Where the `mutatingWebhookConfiguration` or `validatingWebhookConfiguration`
-does not match the type of webhook receiving the token, the request should
+does not match the type of webhook receiving the token, the request may
 be rejected.
 
 ### Token Verification
@@ -894,28 +908,35 @@ The webhook may verify these tokens by taking the following steps:
    is derived deterministically from the webhook url, and is in the format
    `https://<url>/with/path`, where `<url>` matches the one specified in
    the webhook's configuration.
-1. Verify that the JWT is bound to one (and only
-   one) of the [webhook authentication bound object
-   types](#webhook-authentication-bound-object-types), and
-     a. When the bound object is a `ValidatingWebhookConfiguration`, reject
-        the request if the webhook is not a validating admission webhook.
-     b. When the bound object is a `MutatingWebhookConfiguration`, reject
-        the request if the webhook is not a mutating admission webhook.
-     c. When the bound object is an `APIService`, reject the request if
-        the resource named in the `AdmissionReview` request body is not a member
-        of the `APIGroup` and `APIVersion` corresponding to that `APIService`.
+1. Verify that the JWT is bound to either a `ValidatingWebhookConfiguration`
+   or a `MutatingWebhookConfiguration`, but not both.
+1. Verify that the value of the
+   `"webhook-authentication.k8s.io/allowedAPIGroup"` attestation claim is either:
+     a. An exact match for the `APIGroup` of the resource in the
+        `AdmissionReview` request, or
+     a. The exact string `"*"`.
 
+### Token Review
+
+The webhook library will be designed in such a way that does not perform
+`TokenReview`. Nevertheless, it must be possible for bearers or receivers
+of these specialized service account tokens to perform token validation via
+`TokenReview`. Therefore, object-existence checks will need to be added for
+the cases when the private claims contain a `"mutatingWebhookConfiguration"`
+or `"validatingWebhookConfiguration"` field.
+
+`TokenReview` will also validate the existence of at least one `APIService`
+whose `APIGroup` field matches exactly the value corresponding to the
+`"webhook-authentication.k8s.io/allowedAPIGroup"` key in the JWT's
+`"attestationClaims"` private claim.
 
 ### Token Caching and Rotation
 
-When the bound object is an `APIService`, serviceaccount tokens for
-authentication to webhooks are cached per combination of webhook and
-`APIService`. When the bound object is a `ValidatingWebhookConfiguration` or
-`MutatingWebhookConfiguration`, the token will be cached per-webhook. When a
-cached token has expired, the next webhook call for that combination triggers
-a new `TokenRequest`. Tokens will expire after 10 minutes. Anything less is
-considered a validation error, and anything more will be silently shortened
-to 10 minues.
+Service account tokens for authentication to webhooks are cached per
+combination of webhook and `APIGroup`. When a cached token has expired, the
+next webhook call for that combination triggers a new `TokenRequest`. Tokens
+will expire after 10 minutes. Anything less is considered a validation error,
+and anything more will be silently shortened to 10 minutes.
 
 ### Test Plan
 
