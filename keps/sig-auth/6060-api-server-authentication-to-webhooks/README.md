@@ -19,6 +19,7 @@
     - [Flow 3: Aggregated API Server denied/accepted by webhook](#flow-3-aggregated-api-server-deniedaccepted-by-webhook)
       - [JWT payload (both requests)](#jwt-payload-both-requests)
   - [Risks and Mitigations](#risks-and-mitigations)
+    - [Broad access to webhooks](#broad-access-to-webhooks)
     - [Token replay across webhooks](#token-replay-across-webhooks)
     - [Token replay across API groups](#token-replay-across-api-groups)
     - [Service account compromise](#service-account-compromise)
@@ -1030,9 +1031,6 @@ of unique webhook+APIService combinations.
 Yes. Each aggregated API server will have a dedicated service account for
 token requests. `kube-apiserver` will have an additional service account
 for the same purpose. Additional RBAC roles and bindings will be needed.
-
-The JWT itself gains a new field in its private claims (`webhookAuthentication`)
-but this is not stored in etcd.
 
 ###### Will enabling / using this feature result in increasing time taken by any operations covered by existing SLIs/SLOs?
 
