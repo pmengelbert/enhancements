@@ -929,7 +929,7 @@ one for service-configured webhooks.
 #### URL-Configured Webhooks
 
 When the webhook is configured by URL, the audience specified in the
-`TokenRequest` for a webhook autehntication token must be an exact string match.
+`TokenRequest` for a webhook authentication token must be an exact string match.
 There are no equivalents; either a mismatched length, or a single character mismatch
 is considered a total mismatch. Therefore, it is critical to check that both
 match, especially when considering a trailing path separator (e.g.
@@ -962,8 +962,8 @@ vwc := ValidatingWebhookConfiguration{
                 Service: &ServiceReference{
                     Name: "fooname",
                     Namespace: "barspace",
-                    Port: int32(443)
-                    // Port, Path not provided
+                    Port: int32(443),
+                    // Path not provided
                 },
             },
 
@@ -977,8 +977,6 @@ vwc := ValidatingWebhookConfiguration{
 // Default value for path, when none is provided.
 path := "/"
 
-// If Path is
-
 if cc.Service.Path != nil {
     path = *cc.Service.Path
     if !strings.HasPrefix(path, "/") {
@@ -986,12 +984,12 @@ if cc.Service.Path != nil {
         // audience resolving to "https://fooname.barspace.svc:443/".
         // If instead *cc.Service.Path was something else without a leading
         // separator, such as "path/to/hook", the full audience resolves to
-        // "https://fooname.barspace.svc:443/path/too/hook".
+        // "https://fooname.barspace.svc:443/path/to/hook".
         path = "/" + path
     } else {
         // cc.Service.Path already has a leading separator, e.g.
-        // "/path/to/resource", so none is added. The full audience in this case
-        // resolves to "https://fooname.barspace.svc:443/"
+        // "/path/to/hook", so none is added. The full audience in this case
+        // resolves to "https://fooname.barspace.svc:443/path/to/hook"
     }
 } else {
     // cc.Service.Path is not provided, so path is "/" and the full audience
@@ -999,23 +997,20 @@ if cc.Service.Path != nil {
 }
 
 svcAud := fmt.Sprintf("https://%s.%s.svc:%d%s", cc.Service.Name, cc.Service.Namespace, port, path)
-
-if audience == svcAud {
-    return true
-}
 ```
 
 A table of examples will make this logic crystal clear.
 
-| `cc.Service.Name` | `cc.Service.Namespace` | `cc.Service.Port` | `cc.Service.Path` | Audience |
+| `cc.Service.Name` | `cc.Service.Namespace` | `cc.Service.Port` (type `*string` ) | `cc.Service.Path` | Audience |
 | --------- | ---------- | -------------- | ---------------------------- |----------|
-| "fooname" | "barspace" | nil | nil | "https://fooname.barspace.svc:443/" |
-| "fooname" | "barspace" | nil | &"" | "https://fooname.barspace.svc:443/" |
-| "fooname" | "barspace" | nil | &"/" | "https://fooname.barspace.svc:443/" |
-| "fooname" | "barspace" | nil | &"path/to/webhook" | "https://fooname.barspace.svc:443/path/to/webhook" |
-| "fooname" | "barspace" | nil | &"/path/to/webhook" | "https://fooname.barspace.svc:443/path/to/webhook" |
-| "fooname" | "barspace" | nil | &"path/to/webhook/" | "https://fooname.barspace.svc:443/path/to/webhook/" |
-| "fooname" | "barspace" | nil | &"/path/to/webhook/" | "https://fooname.barspace.svc:443/path/to/webhook/" |
+| "fooname" | "barspace" | 0 (default when not provided) | nil | "https://fooname.barspace.svc:443/" |
+| "fooname" | "barspace" | 0 | new("") | "https://fooname.barspace.svc:443/" |
+| "fooname" | "barspace" | 0 | new("/") | "https://fooname.barspace.svc:443/" |
+| "fooname" | "barspace" | 0 | new("path/to/webhook") | "https://fooname.barspace.svc:443/path/to/webhook" |
+| "fooname" | "barspace" | 0 | new("/path/to/webhook") | "https://fooname.barspace.svc:443/path/to/webhook" |
+| "fooname" | "barspace" | 0 | new("path/to/webhook/") | "https://fooname.barspace.svc:443/path/to/webhook/" |
+| "fooname" | "barspace" | 0 | new("/path/to/webhook/") | "https://fooname.barspace.svc:443/path/to/webhook/" |
+| "fooname" | "barspace" | 8443 | nil | "https://fooname.barspace.svc:8443/" |
 | "fooname" | "barspace" | 8443 | &"" | "https://fooname.barspace.svc:8443/" |
 | "fooname" | "barspace" | 8443 | &"path/////with//iregular///separators" | "https://fooname.barspace.svc:8443/path/////with//iregular///separators" |
 | "" | "barspace" | 8443 | &"" | N/A (invalid Name) |
